@@ -1,7 +1,7 @@
 //! Viewer side: receives frames, shows them with Vulkan, and forwards mouse and keyboard input.
 
 use crate::render::{fit, Renderer};
-use crate::{event, keys, mac, Result, EV_BUTTON, EV_KEY, EV_MOVE, EV_SCROLL, MAGIC};
+use crate::{event, keys, mac, prompt, Result, EV_BUTTON, EV_KEY, EV_MOVE, EV_SCROLL, MAGIC};
 use hmac::Mac;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -30,20 +30,42 @@ enum Wake {
     Closed(String),
 }
 
-pub fn run(addr: SocketAddr, name: &str, password: &str, view_only: bool) -> Result<()> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
-    stream.set_nodelay(true)?;
-    let mut hello = [0u8; 22];
-    stream.read_exact(&mut hello)?;
-    if &hello[..6] != MAGIC {
-        return Err("that is not a wrdesk host (or it runs a different version)".into());
+/// Connects and authenticates. The password is only needed (and only asked for) if
+/// the host has one set.
+fn connect(addr: SocketAddr, mut password: Option<String>) -> Result<TcpStream> {
+    let mut asked = false;
+    loop {
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
+        stream.set_nodelay(true)?;
+        let mut hello = [0u8; 23];
+        stream.read_exact(&mut hello)?;
+        if &hello[..6] != MAGIC {
+            return Err("that is not a wrdesk host (or it runs a different version)".into());
+        }
+        let locked = hello[22] != 0;
+        if locked && password.is_none() {
+            // The host does not wait long for the answer, so ask first and reconnect.
+            password = Some(prompt("Password: ")?);
+            asked = true;
+            continue;
+        }
+        let key = if locked { password.as_deref().unwrap_or("") } else { "" };
+        stream.write_all(&mac(key, &hello[6..22]).finalize().into_bytes())?;
+        let mut ok = [0u8; 1];
+        stream.read_exact(&mut ok)?;
+        if ok[0] == 1 {
+            return Ok(stream);
+        }
+        if !asked {
+            return Err("wrong password".into());
+        }
+        println!("Wrong password.");
+        password = None;
     }
-    stream.write_all(&mac(password, &hello[6..]).finalize().into_bytes())?;
-    let mut ok = [0u8; 1];
-    stream.read_exact(&mut ok)?;
-    if ok[0] != 1 {
-        return Err("wrong password".into());
-    }
+}
+
+pub fn run(addr: SocketAddr, name: &str, password: Option<String>, view_only: bool) -> Result<()> {
+    let stream = connect(addr, password)?;
 
     let frame = Arc::new(Mutex::new(Frame::default()));
     let event_loop = EventLoop::<Wake>::with_user_event().build()?;

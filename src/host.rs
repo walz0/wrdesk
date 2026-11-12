@@ -26,7 +26,8 @@ pub fn run(password: &str, options: Options) -> Result<()> {
 
     // Answer discovery broadcasts so clients can find us without an address.
     let udp = UdpSocket::bind(("0.0.0.0", PORT))?;
-    let reply = [ANNOUNCE, name.as_bytes()].concat();
+    let locked = !password.is_empty();
+    let reply = [ANNOUNCE, &[locked as u8], name.as_bytes()].concat();
     thread::spawn(move || {
         let mut buf = [0u8; 64];
         loop {
@@ -39,6 +40,9 @@ pub fn run(password: &str, options: Options) -> Result<()> {
     });
 
     println!("Hosting '{name}' on port {PORT}. Press Ctrl+C to stop.");
+    if !locked {
+        println!("No password set: anyone on this network can view and control this computer (-p sets one).");
+    }
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let password = password.to_string();
@@ -61,6 +65,7 @@ fn serve(mut stream: TcpStream, password: &str, peer: &str, options: Options) ->
     getrandom::getrandom(&mut nonce).map_err(|e| e.to_string())?;
     stream.write_all(MAGIC)?;
     stream.write_all(&nonce)?;
+    stream.write_all(&[!password.is_empty() as u8])?;
     let mut tag = [0u8; 32];
     stream.read_exact(&mut tag)?;
     if mac(password, &nonce).verify_slice(&tag).is_err() {
