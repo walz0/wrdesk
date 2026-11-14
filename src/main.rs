@@ -4,7 +4,8 @@
 //!   wrdesk join [TARGET] [-p PASSWORD]     view and control a host (name or IP; omit to auto-discover)
 //!   wrdesk                                 list the hosts on the network and pick one (or host)
 //!
-//! Hosts are open to the whole LAN unless a password is set.
+//! Hosts are open to the whole LAN unless a password is set. A browser (e.g. on a phone)
+//! can join too: the host prints the address to open.
 //!
 //! Discovery (UDP broadcast): DISCOVER is answered with ANNOUNCE, 1 byte (1 = password set), host name.
 //!
@@ -12,12 +13,22 @@
 //!   host -> client   MAGIC, 16 byte nonce, 1 byte (1 = password set)
 //!   client -> host   HMAC-SHA256(password, nonce); the password is empty if none is set
 //!   host -> client   1 byte (1 = ok), then frames: [u32 w][u32 h][u32 y][u32 rows][u32 len]
-//!                    followed by lz4(rows y..y+rows of the frame XOR the previous frame)
+//!                    followed by lz4(rows y..y+rows of the frame XOR the previous frame).
+//!                    The first frame of a connection is complete.
+//!                    A header with w = 0 is not a frame: h is the packet kind, len the
+//!                    payload size. Kind 0 (all zero) is a keepalive, sent after a second
+//!                    without frames. Kind AUDIO has y = sample rate, rows = channels, and
+//!                    interleaved i16 samples as payload: whatever the host's speakers play.
 //!   client -> host   8 byte input events, see `event`
+//!
+//! Hosts also serve a web client over HTTP on WEB_PORT (for phones). It speaks the same
+//! protocol over HTTP requests, see web.rs.
 
+mod audio;
 mod client;
 mod host;
 mod render;
+mod web;
 
 use hmac::{Hmac, Mac};
 use std::io::Write;
@@ -27,9 +38,11 @@ use std::time::{Duration, Instant};
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub const PORT: u16 = 47110;
-pub const MAGIC: &[u8; 6] = b"WRDSK2";
+pub const WEB_PORT: u16 = 47111; // the host's web client, for browsers
+pub const MAGIC: &[u8; 6] = b"WRDSK3";
 pub const DISCOVER: &[u8] = b"WRDESK?";
 pub const ANNOUNCE: &[u8] = b"WRDESK!";
+pub const AUDIO: u32 = 1; // packet kind, see the wire protocol above
 
 pub const EV_MOVE: u8 = 1; // payload = x << 16 | y, each 0..=65535 across the remote screen
 pub const EV_BUTTON: u8 = 2; // a = 0 left / 1 right / 2 middle, b = pressed

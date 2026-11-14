@@ -1,7 +1,7 @@
 //! Viewer side: receives frames, shows them with Vulkan, and forwards mouse and keyboard input.
 
 use crate::render::{fit, Renderer};
-use crate::{event, keys, mac, prompt, Result, EV_BUTTON, EV_KEY, EV_MOVE, EV_SCROLL, MAGIC};
+use crate::{audio, event, keys, mac, prompt, Result, AUDIO, EV_BUTTON, EV_KEY, EV_MOVE, EV_SCROLL, MAGIC};
 use hmac::Mac;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -27,64 +27,123 @@ struct Frame {
 
 enum Wake {
     Frame,
+    Lost(String),
+    Reconnected,
     Closed(String),
 }
 
-/// Connects and authenticates. The password is only needed (and only asked for) if
-/// the host has one set.
-fn connect(addr: SocketAddr, mut password: Option<String>) -> Result<TcpStream> {
+/// How long the host may stay silent before the link counts as dead. An idle host
+/// still sends a keepalive every second.
+const TIMEOUT: Duration = Duration::from_secs(5);
+
+enum Handshake {
+    Ok(TcpStream),
+    NeedsPassword,
+    Rejected,
+}
+
+fn handshake(addr: SocketAddr, password: Option<&str>) -> Result<Handshake> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(TIMEOUT))?;
+    // Input is sent from the window thread, which must not hang on a dead link.
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    let mut hello = [0u8; 23];
+    stream.read_exact(&mut hello)?;
+    if &hello[..6] != MAGIC {
+        return Err("that is not a wrdesk host (or it runs a different version)".into());
+    }
+    let key = match (hello[22] != 0, password) {
+        (false, _) => "",
+        (true, Some(password)) => password,
+        (true, None) => return Ok(Handshake::NeedsPassword),
+    };
+    stream.write_all(&mac(key, &hello[6..22]).finalize().into_bytes())?;
+    let mut ok = [0u8; 1];
+    stream.read_exact(&mut ok)?;
+    Ok(if ok[0] == 1 { Handshake::Ok(stream) } else { Handshake::Rejected })
+}
+
+/// Connects and authenticates, returning the password that worked. The password is
+/// only needed (and only asked for) if the host has one set.
+fn connect(addr: SocketAddr, mut password: Option<String>) -> Result<(TcpStream, Option<String>)> {
     let mut asked = false;
     loop {
-        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
-        stream.set_nodelay(true)?;
-        let mut hello = [0u8; 23];
-        stream.read_exact(&mut hello)?;
-        if &hello[..6] != MAGIC {
-            return Err("that is not a wrdesk host (or it runs a different version)".into());
-        }
-        let locked = hello[22] != 0;
-        if locked && password.is_none() {
+        match handshake(addr, password.as_deref())? {
+            Handshake::Ok(stream) => return Ok((stream, password)),
             // The host does not wait long for the answer, so ask first and reconnect.
-            password = Some(prompt("Password: ")?);
-            asked = true;
-            continue;
+            Handshake::NeedsPassword => {
+                password = Some(prompt("Password: ")?);
+                asked = true;
+            }
+            Handshake::Rejected if asked => {
+                println!("Wrong password.");
+                password = None;
+            }
+            Handshake::Rejected => return Err("wrong password".into()),
         }
-        let key = if locked { password.as_deref().unwrap_or("") } else { "" };
-        stream.write_all(&mac(key, &hello[6..22]).finalize().into_bytes())?;
-        let mut ok = [0u8; 1];
-        stream.read_exact(&mut ok)?;
-        if ok[0] == 1 {
-            return Ok(stream);
+    }
+}
+
+/// Reconnects after the link died (e.g. this laptop slept), retrying until the host
+/// answers again. Gives up only if the host no longer accepts the password.
+fn reconnect(addr: SocketAddr, password: Option<&str>) -> Result<TcpStream> {
+    loop {
+        match handshake(addr, password) {
+            Ok(Handshake::Ok(stream)) => return Ok(stream),
+            Ok(_) => return Err("the host's password changed".into()),
+            Err(e) if e.is::<std::io::Error>() => thread::sleep(Duration::from_secs(1)), // not reachable yet
+            Err(e) => return Err(e),
         }
-        if !asked {
-            return Err("wrong password".into());
-        }
-        println!("Wrong password.");
-        password = None;
     }
 }
 
 pub fn run(addr: SocketAddr, name: &str, password: Option<String>, view_only: bool) -> Result<()> {
-    let stream = connect(addr, password)?;
+    let (stream, password) = connect(addr, password)?;
 
     let frame = Arc::new(Mutex::new(Frame::default()));
     let event_loop = EventLoop::<Wake>::with_user_event().build()?;
 
     let proxy = event_loop.create_proxy();
-    let (reader, shared) = (stream.try_clone()?, frame.clone());
+    let writer = Arc::new(Mutex::new(stream.try_clone()?));
+    let (shared, swap) = (frame.clone(), writer.clone());
+    let mut player = audio::Player::new().map_err(|e| eprintln!("no audio: {e}")).ok();
     thread::spawn(move || {
-        let reason = match receive(reader, &shared, &proxy) {
-            Ok(()) => return, // the window closed first
-            Err(e) => e.to_string(),
-        };
-        let _ = proxy.send_event(Wake::Closed(reason));
+        let mut stream = stream;
+        loop {
+            let reason = match receive(stream, &shared, &mut player, &proxy) {
+                Ok(()) => return, // the window closed first
+                Err(e) => match e.downcast_ref::<std::io::Error>().map(|e| e.kind()) {
+                    Some(std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                        "the host stopped responding".to_string()
+                    }
+                    _ => e.to_string(),
+                },
+            };
+            if proxy.send_event(Wake::Lost(reason)).is_err() {
+                return;
+            }
+            match reconnect(addr, password.as_deref()).and_then(|s| Ok((s.try_clone()?, s))) {
+                Ok((input, s)) => {
+                    *swap.lock().unwrap() = input;
+                    stream = s;
+                    if proxy.send_event(Wake::Reconnected).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = proxy.send_event(Wake::Closed(e.to_string()));
+                    return;
+                }
+            }
+        }
     });
 
     let mut app = App {
         renderer: None,
         window: None,
         frame,
-        stream,
+        stream: writer,
         view_only,
         title: format!("wrdesk - {name}"),
         remote: (0, 0),
@@ -96,15 +155,38 @@ pub fn run(addr: SocketAddr, name: &str, password: Option<String>, view_only: bo
     app.error.map_or(Ok(()), Err)
 }
 
-/// Network thread: applies each incoming delta to the shared frame and wakes the window.
-fn receive(mut stream: TcpStream, shared: &Mutex<Frame>, proxy: &EventLoopProxy<Wake>) -> Result<()> {
+/// Network thread: applies each incoming delta to the shared frame and wakes the window,
+/// and plays incoming audio. Returns Ok once the window has closed, or the error that
+/// ended the connection.
+fn receive(
+    mut stream: TcpStream,
+    shared: &Mutex<Frame>,
+    player: &mut Option<audio::Player>,
+    proxy: &EventLoopProxy<Wake>,
+) -> Result<()> {
     let mut header = [0u8; 20];
-    let (mut packed, mut delta) = (Vec::new(), Vec::new());
+    let (mut packed, mut delta, mut samples) = (Vec::new(), Vec::new(), Vec::new());
+    // The first frame of a connection is complete; it replaces what an earlier connection left.
+    let mut fresh = true;
     loop {
         stream.read_exact(&mut header)?;
         let field = |i: usize| u32::from_le_bytes([header[i], header[i + 1], header[i + 2], header[i + 3]]);
         let (w, h, y, rows, n) = (field(0), field(4), field(8), field(12), field(16) as usize);
-        if w == 0 || h == 0 || w > 16384 || h > 16384 || rows == 0 || y >= h || rows > h - y {
+        if w == 0 {
+            // Not a frame: h says what it is. Keepalives have no payload.
+            if n > 1 << 20 {
+                return Err("bad packet length".into());
+            }
+            packed.resize(n, 0);
+            stream.read_exact(&mut packed)?;
+            if let (AUDIO, Some(player)) = (h, player.as_mut()) {
+                samples.clear();
+                samples.extend(packed.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
+                player.push(y, rows as u16, &samples);
+            }
+            continue;
+        }
+        if h == 0 || w > 16384 || h > 16384 || rows == 0 || y >= h || rows > h - y {
             return Err("bad frame size".into());
         }
         let row = w as usize * 4;
@@ -120,7 +202,8 @@ fn receive(mut stream: TcpStream, shared: &Mutex<Frame>, proxy: &EventLoopProxy<
         }
         {
             let mut frame = shared.lock().unwrap();
-            if (frame.w, frame.h) != (w, h) {
+            if fresh || (frame.w, frame.h) != (w, h) {
+                fresh = false;
                 *frame = Frame { w, h, data: vec![0; h as usize * row], dirty: None };
             }
             for (pixel, d) in frame.data[y as usize * row..].iter_mut().zip(&delta) {
@@ -139,7 +222,7 @@ struct App {
     renderer: Option<Renderer>, // declared before `window` so it is dropped first
     window: Option<Arc<Window>>,
     frame: Arc<Mutex<Frame>>,
-    stream: TcpStream,
+    stream: Arc<Mutex<TcpStream>>, // for input; replaced when the network thread reconnects
     view_only: bool,
     title: String,
     remote: (u32, u32),
@@ -151,7 +234,8 @@ struct App {
 impl App {
     fn send(&mut self, kind: u8, a: u8, b: u8, payload: u32) {
         if !self.view_only {
-            let _ = self.stream.write_all(&event(kind, a, b, payload)); // the reader thread reports a dead link
+            // The network thread notices a dead link and reconnects.
+            let _ = self.stream.lock().unwrap().write_all(&event(kind, a, b, payload));
         }
     }
 
@@ -201,6 +285,18 @@ impl ApplicationHandler<Wake> for App {
             Wake::Frame => {
                 if let Some(window) = &self.window {
                     window.request_redraw();
+                }
+            }
+            Wake::Lost(reason) => {
+                println!("Connection lost ({reason}), reconnecting...");
+                if let Some(window) = &self.window {
+                    window.set_title(&format!("{} (reconnecting...)", self.title));
+                }
+            }
+            Wake::Reconnected => {
+                println!("Reconnected.");
+                if let Some(window) = &self.window {
+                    window.set_title(&self.title);
                 }
             }
             Wake::Closed(reason) => self.fail(event_loop, format!("connection closed: {reason}").into()),

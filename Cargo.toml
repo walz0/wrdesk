@@ -6,11 +6,13 @@ edition = "2024"
 [dependencies]
 ash = "0.38"
 ash-window = "0.13"
+cpal = "0.18.2"
 enigo = "0.6.1"
 gethostname = "1.1.0"
 getrandom = "0.2"
 hmac = "0.12"
 lz4_flex = "0.14.0"
+qrcode = { version = "0.14.1", default-features = false }
 scrap = "0.5"
 sha2 = "0.10"
 winit = "0.30"

@@ -1,23 +1,40 @@
 //! Host side: captures the primary display, streams it, and injects the client's input.
 
-use crate::{keys, mac, Result, ANNOUNCE, DISCOVER, EV_BUTTON, EV_KEY, EV_MOVE, EV_SCROLL, MAGIC, PORT};
+use crate::{audio, keys, mac, web, Result, ANNOUNCE, AUDIO, DISCOVER, EV_BUTTON, EV_KEY, EV_MOVE, EV_SCROLL, MAGIC, PORT};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use hmac::Mac;
 use scrap::{Capturer, Display};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const HEADER: usize = 20;
+/// An idle host sends an empty header this often, so clients can tell a still screen from a dead link.
+const KEEPALIVE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy)]
 pub struct Options {
     pub fps: u32,
     pub scale: u32,
     pub mbps: f64, // 0 = unlimited
+}
+
+/// A connection to a client: a plain socket, or a browser's HTTP requests.
+pub trait Link: Read + Write + Send + Sized + 'static {
+    fn socket(&self) -> &TcpStream;
+    fn try_clone(&self) -> std::io::Result<Self>;
+}
+
+impl Link for TcpStream {
+    fn socket(&self) -> &TcpStream {
+        self
+    }
+    fn try_clone(&self) -> std::io::Result<Self> {
+        TcpStream::try_clone(self)
+    }
 }
 
 pub fn run(password: &str, options: Options) -> Result<()> {
@@ -40,32 +57,36 @@ pub fn run(password: &str, options: Options) -> Result<()> {
     });
 
     println!("Hosting '{name}' on port {PORT}. Press Ctrl+C to stop.");
+    if let Err(e) = web::listen(password, options) {
+        eprintln!("no web client: {e}");
+    }
     if !locked {
         println!("No password set: anyone on this network can view and control this computer (-p sets one).");
     }
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let password = password.to_string();
-        thread::spawn(move || {
-            let peer = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-            match serve(stream, &password, &peer, options) {
-                Ok(()) => println!("{peer} disconnected"),
-                Err(e) => println!("{peer} disconnected: {e}"),
-            }
-        });
+        thread::spawn(move || session(stream, &password, options));
     }
     Ok(())
 }
 
-fn serve(mut stream: TcpStream, password: &str, peer: &str, options: Options) -> Result<()> {
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+/// Serves one client until it leaves, logging its coming and going.
+pub fn session(stream: impl Link, password: &str, options: Options) {
+    let peer = stream.socket().peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    match serve(stream, password, &peer, options) {
+        Ok(()) => println!("{peer} disconnected"),
+        Err(e) => println!("{peer} disconnected: {e}"),
+    }
+}
+
+fn serve(mut stream: impl Link, password: &str, peer: &str, options: Options) -> Result<()> {
+    stream.socket().set_nodelay(true)?;
+    stream.socket().set_read_timeout(Some(Duration::from_secs(10)))?;
 
     let mut nonce = [0u8; 16];
     getrandom::getrandom(&mut nonce).map_err(|e| e.to_string())?;
-    stream.write_all(MAGIC)?;
-    stream.write_all(&nonce)?;
-    stream.write_all(&[!password.is_empty() as u8])?;
+    stream.write_all(&[&MAGIC[..], &nonce, &[!password.is_empty() as u8]].concat())?;
     let mut tag = [0u8; 32];
     stream.read_exact(&mut tag)?;
     if mac(password, &nonce).verify_slice(&tag).is_err() {
@@ -74,7 +95,10 @@ fn serve(mut stream: TcpStream, password: &str, peer: &str, options: Options) ->
         return Err("wrong password".into());
     }
     stream.write_all(&[1])?;
-    stream.set_read_timeout(None)?;
+    stream.socket().set_read_timeout(None)?;
+    // A client that vanished (e.g. a laptop that went to sleep) stops acknowledging data;
+    // give up on it instead of holding the screen capture for minutes.
+    stream.socket().set_write_timeout(Some(Duration::from_secs(10)))?;
     println!("{peer} connected");
 
     let alive = Arc::new(AtomicBool::new(true));
@@ -87,12 +111,33 @@ fn serve(mut stream: TcpStream, password: &str, peer: &str, options: Options) ->
         input_alive.store(false, Ordering::Relaxed);
     });
 
-    let result = capture_loop(&mut stream, &alive, options);
-    let _ = stream.shutdown(Shutdown::Both); // also ends the input thread
+    // Video and audio packets share the connection; each is written whole under the lock.
+    let writer = Arc::new(Mutex::new(stream.try_clone()?));
+    let (audio_writer, audio_alive) = (writer.clone(), alive.clone());
+    thread::spawn(move || {
+        let mut packet = Vec::new();
+        let result = audio::capture(&audio_alive, |rate, channels, samples| {
+            packet.clear();
+            for value in [0, AUDIO, rate, channels as u32, samples.len() as u32 * 2] {
+                packet.extend_from_slice(&value.to_le_bytes());
+            }
+            packet.extend(samples.iter().flat_map(|s| s.to_le_bytes()));
+            Ok(audio_writer.lock().unwrap().write_all(&packet)?)
+        });
+        if let Err(e) = result
+            && audio_alive.load(Ordering::Relaxed)
+        {
+            eprintln!("no audio: {e}");
+        }
+    });
+
+    let result = capture_loop(&writer, &alive, options);
+    alive.store(false, Ordering::Relaxed); // stops the audio thread
+    let _ = stream.socket().shutdown(Shutdown::Both); // also ends the input thread
     result
 }
 
-fn capture_loop(stream: &mut TcpStream, alive: &AtomicBool, options: Options) -> Result<()> {
+fn capture_loop(stream: &Mutex<impl Write>, alive: &AtomicBool, options: Options) -> Result<()> {
     let frame_time = Duration::from_secs_f64(1.0 / options.fps as f64);
     let scale = options.scale as usize;
     let mut capturer: Option<Capturer> = None;
@@ -100,9 +145,14 @@ fn capture_loop(stream: &mut TcpStream, alive: &AtomicBool, options: Options) ->
     let (mut prev, mut scaled, mut delta, mut out) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut size = (0, 0);
     let mut force = false;
+    let mut last_sent = Instant::now();
 
     while alive.load(Ordering::Relaxed) {
         let start = Instant::now();
+        if last_sent.elapsed() >= KEEPALIVE {
+            stream.lock().unwrap().write_all(&[0; HEADER])?;
+            last_sent = start;
+        }
         let cap = match &mut capturer {
             Some(cap) => cap,
             None => match Display::primary().and_then(Capturer::new) {
@@ -167,7 +217,8 @@ fn capture_loop(stream: &mut TcpStream, alive: &AtomicBool, options: Options) ->
                         for (i, value) in [w, h, y0, y1 - y0, n].into_iter().enumerate() {
                             out[i * 4..i * 4 + 4].copy_from_slice(&(value as u32).to_le_bytes());
                         }
-                        stream.write_all(&out[..HEADER + n])?;
+                        stream.lock().unwrap().write_all(&out[..HEADER + n])?;
+                        last_sent = Instant::now();
                         force = false;
                         Ok(HEADER + n)
                     }
@@ -198,7 +249,7 @@ fn capture_loop(stream: &mut TcpStream, alive: &AtomicBool, options: Options) ->
     Ok(())
 }
 
-fn input_loop(mut stream: TcpStream) -> Result<()> {
+fn input_loop(mut stream: impl Read) -> Result<()> {
     let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
     let direction = |pressed: u8| if pressed != 0 { Direction::Press } else { Direction::Release };
     let mut ev = [0u8; 8];

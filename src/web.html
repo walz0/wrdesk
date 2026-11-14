@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>wrdesk</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none; background: #111; color: #eee; font: 16px system-ui, sans-serif; }
+  #root { position: fixed; left: 0; top: 0; width: 100%; height: 100%; display: flex; flex-direction: column; }
+  #view { flex: 1; position: relative; overflow: hidden; touch-action: none; }
+  canvas { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  #bar { display: flex; overflow-x: auto; background: #222; touch-action: pan-x; }
+  #bar button { flex: 1 0 46px; height: 44px; border: 0; border-right: 1px solid #111; background: none; color: inherit; font: inherit; }
+  #bar button.on { background: #47c; }
+  #keys { position: fixed; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0; font-size: 16px; pointer-events: none; }
+  #login { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 20px; background: #111; text-align: center; }
+  #login input, #login button { font: inherit; padding: 10px 14px; border-radius: 6px; border: 1px solid #555; background: #222; color: inherit; width: 220px; box-sizing: border-box; }
+  #login button { background: #47c; border-color: #47c; }
+  #login small { color: #999; line-height: 1.6; }
+  #note { position: fixed; top: 8px; left: 50%; transform: translateX(-50%); padding: 6px 12px; border-radius: 6px; background: #000c; }
+  [hidden] { display: none !important; }
+</style>
+<div id="root">
+  <div id="view"><canvas></canvas></div>
+  <div id="bar">
+    <button id="kb">&#9000;</button>
+    <button data-key="5">Esc</button>
+    <button data-key="2">Tab</button>
+    <button data-key="17" data-sticky>Ctrl</button>
+    <button data-key="18" data-sticky>Alt</button>
+    <button data-key="19" data-sticky>Win</button>
+    <button data-key="4">&#9003;</button>
+    <button data-key="6">Del</button>
+    <button data-key="12">&larr;</button>
+    <button data-key="14">&uarr;</button>
+    <button data-key="15">&darr;</button>
+    <button data-key="13">&rarr;</button>
+  </div>
+</div>
+<input id="keys" type="text" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false">
+<div id="note" hidden>Reconnecting&hellip;</div>
+<form id="login">
+  <b>wrdesk</b>
+  <input id="password" type="password" placeholder="Password" hidden>
+  <button>Connect</button>
+  <span id="message"></span>
+  <small>tap = click &middot; hold = right click &middot; hold, then drag = drag<br>swipe = scroll &middot; pinch = zoom</small>
+</form>
+<script>
+'use strict';
+// Browsers only offer crypto.subtle to https pages, so the handshake's HMAC-SHA256 is done here.
+const K = [
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+function sha256(message) {
+  const h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+  const padded = new Uint8Array((message.length + 9 + 63) & ~63);
+  padded.set(message);
+  padded[message.length] = 0x80;
+  const view = new DataView(padded.buffer);
+  view.setUint32(padded.length - 4, message.length * 8);
+  const w = new Uint32Array(64), rot = (x, n) => x >>> n | x << 32 - n;
+  for (let block = 0; block < padded.length; block += 64) {
+    for (let i = 0; i < 64; i++) {
+      w[i] = i < 16 ? view.getUint32(block + i * 4)
+        : (rot(w[i - 2], 17) ^ rot(w[i - 2], 19) ^ w[i - 2] >>> 10) + w[i - 7]
+          + (rot(w[i - 15], 7) ^ rot(w[i - 15], 18) ^ w[i - 15] >>> 3) + w[i - 16];
+    }
+    let [a, b, c, d, e, f, g, k] = h;
+    for (let i = 0; i < 64; i++) {
+      const t1 = k + (rot(e, 6) ^ rot(e, 11) ^ rot(e, 25)) + (e & f ^ ~e & g) + K[i] + w[i] | 0;
+      const t2 = (rot(a, 2) ^ rot(a, 13) ^ rot(a, 22)) + (a & b ^ a & c ^ b & c) | 0;
+      k = g; g = f; f = e; e = d + t1 | 0; d = c; c = b; b = a; a = t1 + t2 | 0;
+    }
+    [a, b, c, d, e, f, g, k].forEach((x, i) => h[i] = h[i] + x | 0);
+  }
+  const out = new DataView(new ArrayBuffer(32));
+  h.forEach((x, i) => out.setUint32(i * 4, x));
+  return new Uint8Array(out.buffer);
+}
+
+function hmac(key, message) {
+  if (key.length > 64) key = sha256(key);
+  const pad = x => { const p = new Uint8Array(64).fill(x); key.forEach((b, i) => p[i] ^= b); return p; };
+  const join = (a, b) => { const j = new Uint8Array(a.length + b.length); j.set(a); j.set(b, a.length); return j; };
+  return sha256(join(pad(0x5c), sha256(join(pad(0x36), message))));
+}
+
+// Decompresses an lz4 block into `dst`, returning the size.
+function lz4(src, dst) {
+  let s = 0, d = 0;
+  const more = n => { if (n == 15) { let b; do { b = src[s++]; n += b; } while (b == 255); } return n; };
+  while (s < src.length) {
+    const token = src[s++], literals = more(token >> 4);
+    dst.set(src.subarray(s, s + literals), d);
+    s += literals; d += literals;
+    if (s >= src.length) break;
+    const offset = src[s] | src[s + 1] << 8;
+    s += 2;
+    const length = more(token & 15) + 4;
+    let from = d - offset;
+    if (offset == 1) dst.fill(dst[from], d, d += length); // a run, e.g. the unchanged part of the screen
+    else if (offset >= length) dst.copyWithin(d, from, from + length), d += length;
+    else for (const end = d + length; d < end;) dst[d++] = dst[from++];
+  }
+  return d;
+}
+
+const $ = id => document.getElementById(id);
+const root = $('root'), view = $('view'), bar = $('bar'), keys = $('keys'), login = $('login');
+const canvas = view.firstChild, context = canvas.getContext('2d', { alpha: false });
+const locked = __LOCKED__;
+$('password').hidden = !locked;
+
+// ---- connection ----
+// The host's packets are the endless body of one request; ours are posted, one request at a time.
+
+const MOVE = 1, BUTTON = 2, SCROLL = 3, KEY = 4;
+let id = '', hangUp = null; // the connection, and what ends it
+let live = false, lastPacket = 0;
+let retry = false; // a connection that worked is re-established when it drops
+let outbox = [], posting = false;
+
+function join(parts) {
+  const all = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let at = 0;
+  for (const part of parts) all.set(part, at), at += part.length;
+  return all;
+}
+
+async function post(bytes) {
+  outbox.push(bytes);
+  if (posting) return;
+  posting = true;
+  while (outbox.length) {
+    // Everything that piled up during the last request goes in this one, in order.
+    await fetch(`/input?id=${id}`, { method: 'POST', body: join(outbox.splice(0)) }).catch(() => {});
+  }
+  posting = false;
+}
+
+function send(kind, a, b, payload) {
+  if (!live) return;
+  const event = new DataView(new ArrayBuffer(8));
+  event.setUint8(0, kind);
+  event.setUint8(1, a);
+  event.setUint8(2, b);
+  event.setUint32(4, payload, true);
+  post(new Uint8Array(event.buffer));
+}
+
+async function connect() {
+  const mine = id = [...crypto.getRandomValues(new Uint8Array(16))].map(b => b.toString(16).padStart(2, '0')).join('');
+  const abort = new AbortController();
+  hangUp = () => abort.abort();
+  outbox = [];
+  lastPacket = Date.now();
+  let stage = 0, refused = '', opened = false;
+  // Takes one message of the handshake, or one packet after it. Returns why to give up, if so.
+  const message = bytes => {
+    if (stage == 0) {
+      // "WRDSK3", 16 byte nonce, 1 byte (1 = password set)
+      if (String.fromCharCode(...bytes.subarray(0, 6)) != 'WRDSK3') return 'This page is out of date: reload it.';
+      post(hmac(new TextEncoder().encode($('password').value), bytes.subarray(6, 22)));
+      stage = 1;
+    } else if (stage == 1) {
+      if (bytes[0] != 1) return 'Wrong password.';
+      stage = 2;
+      live = retry = fresh = true;
+      login.hidden = $('note').hidden = true;
+    } else {
+      packet(bytes);
+    }
+  };
+  try {
+    const response = await fetch(`/stream?id=${id}`, { signal: abort.signal });
+    opened = response.ok;
+    const reader = response.body.getReader();
+    // The body arrives in arbitrary pieces: `need` bytes make the next message.
+    let pieces = [], have = 0, need = 23, sized = false;
+    while (opened && !refused) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      lastPacket = Date.now();
+      pieces.push(value);
+      have += value.length;
+      while (have >= need && !refused) {
+        if (pieces.length > 1) pieces = [join(pieces)];
+        if (stage == 2 && !sized) {
+          // A packet is its 20 byte header and as many bytes as the header's last field says.
+          need += new DataView(pieces[0].buffer, pieces[0].byteOffset).getUint32(16, true);
+          sized = true;
+          continue;
+        }
+        const bytes = pieces[0].subarray(0, need);
+        pieces[0] = pieces[0].subarray(need);
+        have -= need;
+        refused = message(bytes) || '';
+        need = stage == 1 ? 1 : 20;
+        sized = false;
+      }
+    }
+  } catch (error) {
+    if (opened && stage < 2 && !abort.signal.aborted) refused = `This browser failed to sign in: ${error.message}`;
+  }
+  abort.abort();
+  if (mine != id) return;
+  hangUp = null;
+  live = false;
+  if (retry && !refused) {
+    $('note').hidden = false;
+    setTimeout(connect, 1000);
+  } else {
+    retry = false;
+    $('note').hidden = true;
+    login.hidden = false;
+    // Which step failed tells a network problem from a host or browser one.
+    $('message').textContent = refused || (!opened ? 'Cannot reach the host.'
+      : stage == 0 ? 'The host answered, then went silent.' : 'The host hung up while signing in.');
+  }
+}
+
+// The host sends something at least every second; silence means the link is dead.
+setInterval(() => {
+  if (hangUp && Date.now() - lastPacket > 5000) hangUp(); // the browser may take a long time to notice
+}, 1000);
+
+login.onsubmit = e => {
+  e.preventDefault();
+  $('message').textContent = 'Connecting…';
+  audio ||= new (window.AudioContext || window.webkitAudioContext)(); // must start from a tap
+  audio.resume();
+  connect();
+};
+
+// ---- video ----
+
+let image, pixels, delta = new Uint8Array(0);
+let fresh = true; // the first frame of a connection is complete
+
+function packet(bytes) {
+  const header = new DataView(bytes.buffer, bytes.byteOffset);
+  const [w, h, y, rows, n] = [0, 4, 8, 12, 16].map(i => header.getUint32(i, true));
+  if (w == 0) {
+    // Not a frame: h is the kind. 1 = audio, with y = sample rate and rows = channels.
+    if (h == 1) play(y, rows, new Int16Array(bytes.slice(20, 20 + (n & ~1)).buffer));
+    return;
+  }
+  if (fresh || canvas.width != w || canvas.height != h) {
+    fresh = false;
+    canvas.width = w;
+    canvas.height = h;
+    image = context.createImageData(w, h);
+    pixels = new Uint32Array(image.data.buffer);
+    pixels.fill(0xff000000); // black, opaque
+    layout();
+  }
+  if (delta.length < rows * w * 4) delta = new Uint8Array(rows * w * 4);
+  lz4(bytes.subarray(20, 20 + n), delta);
+  // The delta is BGRA, the canvas RGBA: swap red and blue while applying the XOR.
+  const changes = new Uint32Array(delta.buffer, 0, rows * w);
+  for (let i = 0, at = y * w; i < changes.length; i++, at++) {
+    const c = changes[i];
+    if (c) pixels[at] ^= c & 0xff00 | c >>> 16 & 0xff | (c & 0xff) << 16;
+  }
+  context.putImageData(image, 0, 0, 0, y, w, rows);
+}
+
+// ---- audio ----
+
+let audio, playAt = 0;
+
+function play(rate, channels, samples) {
+  const frames = Math.floor(samples.length / channels);
+  if (!audio || !rate || !frames) return;
+  const now = audio.currentTime;
+  if (playAt < now) playAt = now + 0.06; // starting, or we ran dry: build a small cushion
+  if (playAt > now + 0.4) return; // too far behind: drop to catch up
+  const buffer = audio.createBuffer(channels, frames, rate);
+  for (let c = 0; c < channels; c++) {
+    const out = buffer.getChannelData(c);
+    for (let i = 0; i < frames; i++) out[i] = samples[i * channels + c] / 32768;
+  }
+  const source = audio.createBufferSource();
+  source.buffer = buffer;
+  source.connect(audio.destination);
+  source.start(playAt);
+  playAt += frames / rate;
+}
+
+// ---- layout: the screen is fitted to the view, and can be zoomed and panned ----
+
+let zoom = 1, scale = 1, panX = 0, panY = 0;
+
+function layout() {
+  const w = canvas.width, h = canvas.height, roomX = view.clientWidth, roomY = view.clientHeight;
+  scale = Math.min(roomX / w, roomY / h) * zoom;
+  const place = (pan, size, room) => size <= room ? (room - size) / 2 : Math.min(0, Math.max(room - size, pan));
+  panX = place(panX, w * scale, roomX);
+  panY = place(panY, h * scale, roomY);
+  canvas.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
+}
+
+// Keeps the page above the on-screen keyboard.
+function resize() {
+  const viewport = window.visualViewport;
+  if (viewport) {
+    root.style.top = viewport.offsetTop + 'px';
+    root.style.height = viewport.height + 'px';
+  }
+  layout();
+}
+window.visualViewport?.addEventListener('resize', resize);
+window.visualViewport?.addEventListener('scroll', resize);
+window.addEventListener('resize', resize);
+resize();
+
+// A point of the view (a touch or mouse event) as the position on the remote screen.
+function position(point) {
+  const box = view.getBoundingClientRect();
+  const axis = (v, size) => Math.max(0, Math.min(65535, Math.round(v / scale / size * 65535)));
+  return axis(point.clientX - box.left - panX, canvas.width) << 16 | axis(point.clientY - box.top - panY, canvas.height);
+}
+
+// ---- pointer input ----
+
+const STEP = 30; // pixels of swipe per scroll line
+let scrollX = 0, scrollY = 0;
+
+// Sends whole scroll lines (positive = right/down), carrying the remainder over.
+function scroll(dx, dy) {
+  scrollX += dx;
+  scrollY += dy;
+  const x = Math.trunc(scrollX), y = Math.trunc(scrollY);
+  scrollX -= x;
+  scrollY -= y;
+  if (y) send(SCROLL, 0, 0, y);
+  if (x) send(SCROLL, 1, 0, x);
+}
+
+// The touch gesture in progress. mode: tap -> hold (after a moment) -> drag, or tap -> scroll,
+// or pinch (two fingers), or done (ignore until all fingers are lifted).
+let gesture = null;
+
+function finish(act) {
+  if (!gesture) return;
+  clearTimeout(gesture.timer);
+  if (gesture.mode == 'drag') send(BUTTON, 0, 0, 0);
+  if (act && (gesture.mode == 'tap' || gesture.mode == 'hold')) {
+    const button = gesture.mode == 'tap' ? 0 : 1;
+    send(MOVE, 0, 0, gesture.start);
+    send(BUTTON, button, 1, 0);
+    send(BUTTON, button, 0, 0);
+  }
+  gesture = null;
+}
+
+function fingers(e) {
+  const [a, b] = e.touches, box = view.getBoundingClientRect();
+  return {
+    spread: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY),
+    x: (a.clientX + b.clientX) / 2 - box.left,
+    y: (a.clientY + b.clientY) / 2 - box.top,
+  };
+}
+
+view.addEventListener('touchstart', e => {
+  e.preventDefault();
+  finish(false);
+  if (e.touches.length == 1) {
+    const touch = e.touches[0];
+    const mine = gesture = { mode: 'tap', x: touch.clientX, y: touch.clientY, start: position(touch) };
+    mine.timer = setTimeout(() => {
+      if (gesture == mine && mine.mode == 'tap') {
+        mine.mode = 'hold';
+        navigator.vibrate?.(20);
+      }
+    }, 400);
+  } else if (e.touches.length == 2) {
+    const now = fingers(e);
+    // (x, y) is the point of the remote screen under the fingers, which stays under them.
+    gesture = { mode: 'pinch', spread: now.spread, zoom, x: (now.x - panX) / scale, y: (now.y - panY) / scale };
+  } else {
+    gesture = { mode: 'done' };
+  }
+}, { passive: false });
+
+view.addEventListener('touchmove', e => {
+  e.preventDefault();
+  if (!gesture) return;
+  const touch = e.touches[0];
+  if (gesture.mode == 'pinch') {
+    const now = fingers(e);
+    zoom = Math.max(1, Math.min(10, gesture.zoom * now.spread / gesture.spread));
+    layout();
+    panX = now.x - gesture.x * scale;
+    panY = now.y - gesture.y * scale;
+    layout();
+    return;
+  }
+  const moved = Math.hypot(touch.clientX - gesture.x, touch.clientY - gesture.y) > 10;
+  if (moved && (gesture.mode == 'tap' || gesture.mode == 'hold')) {
+    clearTimeout(gesture.timer);
+    send(MOVE, 0, 0, gesture.start);
+    if (gesture.mode == 'hold') send(BUTTON, 0, 1, 0);
+    gesture.mode = gesture.mode == 'hold' ? 'drag' : 'scroll';
+    gesture.x = touch.clientX;
+    gesture.y = touch.clientY;
+  }
+  if (gesture.mode == 'drag') send(MOVE, 0, 0, position(touch));
+  if (gesture.mode == 'scroll') {
+    // The content follows the finger: swiping up scrolls down.
+    scroll((gesture.x - touch.clientX) / STEP, (gesture.y - touch.clientY) / STEP);
+    gesture.x = touch.clientX;
+    gesture.y = touch.clientY;
+  }
+}, { passive: false });
+
+view.addEventListener('touchend', e => {
+  e.preventDefault();
+  if (e.touches.length == 0) finish(true);
+  else if (gesture) gesture.mode = 'done';
+}, { passive: false });
+view.addEventListener('touchcancel', () => finish(false));
+
+// A real mouse (a desktop browser) is passed straight through.
+view.addEventListener('pointermove', e => {
+  if (e.pointerType == 'mouse') send(MOVE, 0, 0, position(e));
+});
+for (const [type, pressed] of [['pointerdown', 1], ['pointerup', 0]]) {
+  view.addEventListener(type, e => {
+    if (e.pointerType != 'mouse') return;
+    if (pressed) view.setPointerCapture(e.pointerId);
+    send(MOVE, 0, 0, position(e));
+    send(BUTTON, [0, 2, 1][e.button] ?? 0, pressed, 0); // ours: 0 left, 1 right, 2 middle
+  });
+}
+view.addEventListener('wheel', e => {
+  e.preventDefault();
+  scroll(e.deltaX / 100, e.deltaY / 100);
+}, { passive: false });
+view.addEventListener('contextmenu', e => e.preventDefault());
+
+// ---- keyboard ----
+
+// Ids of the non-character keys, see `keys` in main.rs.
+const NAMED = {
+  Enter: 1, Tab: 2, Backspace: 4, Escape: 5, Delete: 6, Insert: 7, Home: 8, End: 9, PageUp: 10, PageDown: 11,
+  ArrowLeft: 12, ArrowRight: 13, ArrowUp: 14, ArrowDown: 15, Shift: 16, Control: 17, Alt: 18, Meta: 19, CapsLock: 20,
+};
+for (let i = 1; i <= 12; i++) NAMED['F' + i] = 100 + i;
+
+// Presses and releases a key, then lets go of the toolbar's modifiers: they apply to one key.
+function type(named, code) {
+  send(KEY, named, 1, code);
+  send(KEY, named, 0, code);
+  for (const button of bar.querySelectorAll('.on')) {
+    button.classList.remove('on');
+    send(KEY, 1, 0, +button.dataset.key);
+  }
+}
+
+bar.addEventListener('mousedown', e => e.preventDefault()); // keeps the on-screen keyboard open
+bar.addEventListener('click', e => {
+  const button = e.target.closest('button');
+  if (!button) return;
+  if (button.id == 'kb') {
+    document.activeElement == keys ? keys.blur() : keys.focus();
+  } else if ('sticky' in button.dataset) {
+    send(KEY, 1, +button.classList.toggle('on'), +button.dataset.key);
+  } else {
+    type(1, +button.dataset.key);
+  }
+});
+
+// On-screen keyboards report text, not keys: whatever they do to the hidden field
+// (typing, autocorrect, deleting) is replayed on the host as backspaces and characters.
+let typed = '';
+keys.addEventListener('input', () => {
+  const now = keys.value;
+  let same = 0;
+  while (same < typed.length && typed[same] == now[same]) same++;
+  for (const _ of typed.slice(same)) type(1, NAMED.Backspace);
+  for (const char of now.slice(same)) type(0, char.codePointAt(0));
+  typed = now;
+});
+keys.addEventListener('blur', () => keys.value = typed = '');
+
+// Backspace in the empty field changes nothing, so it is caught here. Depending on the
+// browser it shows up as a key, as an edit, or both.
+let erased = 0;
+function erase(e) {
+  if (e.timeStamp - erased > 50) type(1, NAMED.Backspace);
+  erased = e.timeStamp;
+}
+keys.addEventListener('beforeinput', e => {
+  if (e.inputType.startsWith('delete') && !keys.value) erase(e);
+});
+
+for (const [name, pressed] of [['keydown', 1], ['keyup', 0]]) {
+  document.addEventListener(name, e => {
+    if (login.contains(e.target)) return;
+    const field = e.target == keys, id = NAMED[e.key];
+    if (id == NAMED.Backspace && field) {
+      if (pressed && !keys.value) erase(e);
+    } else if (id) {
+      e.preventDefault();
+      send(KEY, 1, pressed, id);
+      if (id == NAMED.Enter) keys.value = typed = '';
+    } else if ([...e.key].length == 1 && (!field || e.ctrlKey || e.altKey || e.metaKey)) {
+      // Characters typed into the field arrive through its input event instead.
+      e.preventDefault();
+      send(KEY, 0, pressed, e.key.codePointAt(0));
+    }
+  });
+}
+</script>
+</html>
