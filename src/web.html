@@ -34,6 +34,7 @@
     <button data-key="14">&uarr;</button>
     <button data-key="15">&darr;</button>
     <button data-key="13">&rarr;</button>
+    <button id="full">&#10530;</button>
   </div>
 </div>
 <input id="keys" type="text" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false">
@@ -454,17 +455,32 @@ view.addEventListener('contextmenu', e => e.preventDefault());
 const NAMED = {
   Enter: 1, Tab: 2, Backspace: 4, Escape: 5, Delete: 6, Insert: 7, Home: 8, End: 9, PageUp: 10, PageDown: 11,
   ArrowLeft: 12, ArrowRight: 13, ArrowUp: 14, ArrowDown: 15, Shift: 16, Control: 17, Alt: 18, Meta: 19, CapsLock: 20,
+  PrintScreen: 21, ContextMenu: 22, Pause: 23, ScrollLock: 24, NumLock: 25,
 };
 for (let i = 1; i <= 12; i++) NAMED['F' + i] = 100 + i;
 
 // Presses and releases a key, then lets go of the toolbar's modifiers: they apply to one key.
-function type(named, code) {
-  send(KEY, named, 1, code);
-  send(KEY, named, 0, code);
+function type(kind, code) {
+  send(KEY, kind, 1, code);
+  send(KEY, kind, 0, code);
   for (const button of bar.querySelectorAll('.on')) {
     button.classList.remove('on');
     send(KEY, 1, 0, +button.dataset.key);
   }
+}
+
+// Keys held when the page loses focus (Alt+Tab away) are never seen released.
+window.addEventListener('blur', () => {
+  for (const button of bar.querySelectorAll('.on')) button.classList.remove('on');
+  for (const id of [NAMED.Shift, NAMED.Control, NAMED.Alt, NAMED.Meta]) send(KEY, 1, 0, id);
+});
+
+// Full screen is where a browser that can (Chromium, on https or localhost) hands over the
+// keys it keeps for itself: Esc, Ctrl+W, Alt+Tab, Win... Holding Esc leaves.
+$('full').hidden = !document.documentElement.requestFullscreen;
+function fullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().then(() => navigator.keyboard?.lock?.()).catch(() => {});
 }
 
 bar.addEventListener('mousedown', e => e.preventDefault()); // keeps the on-screen keyboard open
@@ -473,6 +489,8 @@ bar.addEventListener('click', e => {
   if (!button) return;
   if (button.id == 'kb') {
     document.activeElement == keys ? keys.blur() : keys.focus();
+  } else if (button.id == 'full') {
+    fullscreen();
   } else if ('sticky' in button.dataset) {
     send(KEY, 1, +button.classList.toggle('on'), +button.dataset.key);
   } else {
@@ -488,7 +506,7 @@ keys.addEventListener('input', () => {
   let same = 0;
   while (same < typed.length && typed[same] == now[same]) same++;
   for (const _ of typed.slice(same)) type(1, NAMED.Backspace);
-  for (const char of now.slice(same)) type(0, char.codePointAt(0));
+  for (const char of now.slice(same)) type(2, char.codePointAt(0));
   typed = now;
 });
 keys.addEventListener('blur', () => keys.value = typed = '');
@@ -504,6 +522,7 @@ keys.addEventListener('beforeinput', e => {
   if (e.inputType.startsWith('delete') && !keys.value) erase(e);
 });
 
+let printing = 0;
 for (const [name, pressed] of [['keydown', 1], ['keyup', 0]]) {
   document.addEventListener(name, e => {
     if (login.contains(e.target)) return;
@@ -512,12 +531,15 @@ for (const [name, pressed] of [['keydown', 1], ['keyup', 0]]) {
       if (pressed && !keys.value) erase(e);
     } else if (id) {
       e.preventDefault();
+      // Windows keeps the press of Print Screen from the page: only its release arrives.
+      if (id == NAMED.PrintScreen && !pressed && !printing) send(KEY, 1, 1, id);
+      if (id == NAMED.PrintScreen) printing = pressed;
       send(KEY, 1, pressed, id);
       if (id == NAMED.Enter) keys.value = typed = '';
     } else if ([...e.key].length == 1 && (!field || e.ctrlKey || e.altKey || e.metaKey)) {
       // Characters typed into the field arrive through its input event instead.
       e.preventDefault();
-      send(KEY, 0, pressed, e.key.codePointAt(0));
+      send(KEY, 2, pressed, e.key.codePointAt(0));
     }
   });
 }

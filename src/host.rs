@@ -252,6 +252,9 @@ fn capture_loop(stream: &Mutex<impl Write>, alive: &AtomicBool, options: Options
 fn input_loop(mut stream: impl Read) -> Result<()> {
     let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
     let direction = |pressed: u8| if pressed != 0 { Direction::Press } else { Direction::Release };
+    let mut modifiers = [false; 4]; // Shift, Control, Alt and Meta, as the client holds them
+    #[cfg(windows)]
+    let mut down = Vec::new();
     let mut ev = [0u8; 8];
     loop {
         if stream.read_exact(&mut ev).is_err() {
@@ -273,10 +276,19 @@ fn input_loop(mut stream: impl Read) -> Result<()> {
                 enigo.button(button, direction(ev[2]))
             }
             EV_SCROLL => enigo.scroll(payload as i32, if ev[1] == 0 { Axis::Vertical } else { Axis::Horizontal }),
-            EV_KEY => match key(ev[1], payload) {
-                Some(key) => enigo.key(key, direction(ev[2])),
-                None => Ok(()),
-            },
+            EV_KEY => {
+                if ev[1] == 1 && (keys::SHIFT..=keys::META).contains(&payload) {
+                    modifiers[(payload - keys::SHIFT) as usize] = ev[2] != 0;
+                }
+                match (ev[1], char::from_u32(payload)) {
+                    #[cfg(windows)]
+                    (2, Some(c)) => produced(&mut enigo, c, ev[2] != 0, modifiers, &mut down),
+                    _ => match key(ev[1], payload) {
+                        Some(key) => enigo.key(key, direction(ev[2])),
+                        None => Ok(()),
+                    },
+                }
+            }
             _ => Ok(()),
         };
         if let Err(e) = result {
@@ -285,8 +297,45 @@ fn input_loop(mut stream: impl Read) -> Result<()> {
     }
 }
 
+/// Enters a character that has its modifiers applied already ('A', not 'a' with Shift), with
+/// `down` the keys this has pressed. enigo cannot: it presses no key at all for a shifted one.
+///
+/// The character's key is pressed if the Shift the client holds is the one the character takes,
+/// or if other modifiers make it a shortcut. Otherwise the character is entered as text.
+#[cfg(windows)]
+fn produced(enigo: &mut Enigo, c: char, pressed: bool, modifiers: [bool; 4], down: &mut Vec<u32>) -> enigo::InputResult<()> {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn VkKeyScanW(ch: u16) -> i16; // key | modifiers << 8 (1 = Shift, 2 = Control, 4 = Alt), or -1
+    }
+    let found = match *c.encode_utf16(&mut [0; 2]) {
+        [unit] => unsafe { VkKeyScanW(unit) },
+        _ => -1,
+    };
+    let key = found as u32 & 0xff;
+    if !pressed {
+        // The key may be released under another Shift, so as another character, than it was pressed.
+        return match down.iter().position(|&held| held == key) {
+            Some(at) if found != -1 => {
+                down.swap_remove(at);
+                enigo.key(Key::Other(key), Direction::Release)
+            }
+            _ => Ok(()),
+        };
+    }
+    let [shift, control, alt, meta] = modifiers;
+    if found != -1 && (control || alt || meta || found >> 8 == shift as i16) {
+        if !down.contains(&key) {
+            down.push(key);
+        }
+        enigo.key(Key::Other(key), Direction::Press)
+    } else {
+        enigo.text(c.encode_utf8(&mut [0; 4]))
+    }
+}
+
 fn key(kind: u8, code: u32) -> Option<Key> {
-    if kind == 0 {
+    if kind != 1 {
         return char::from_u32(code).map(Key::Unicode);
     }
     Some(match code {
@@ -311,6 +360,16 @@ fn key(kind: u8, code: u32) -> Option<Key> {
         keys::ALT => Key::Alt,
         keys::META => Key::Meta,
         keys::CAPS_LOCK => Key::CapsLock,
+        #[cfg(windows)]
+        keys::PRINT_SCREEN => Key::PrintScr,
+        #[cfg(windows)]
+        keys::MENU => Key::Apps,
+        #[cfg(windows)]
+        keys::PAUSE => Key::Pause,
+        #[cfg(windows)]
+        keys::SCROLL_LOCK => Key::Scroll,
+        #[cfg(windows)]
+        keys::NUM_LOCK => Key::Numlock,
         101 => Key::F1,
         102 => Key::F2,
         103 => Key::F3,

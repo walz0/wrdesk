@@ -47,7 +47,9 @@ pub const AUDIO: u32 = 1; // packet kind, see the wire protocol above
 pub const EV_MOVE: u8 = 1; // payload = x << 16 | y, each 0..=65535 across the remote screen
 pub const EV_BUTTON: u8 = 2; // a = 0 left / 1 right / 2 middle, b = pressed
 pub const EV_SCROLL: u8 = 3; // a = 0 vertical / 1 horizontal, payload = lines as i32
-pub const EV_KEY: u8 = 4; // a = 0 unicode char / 1 named key (see `keys`), b = pressed
+// a = 0 the character a key types without modifiers / 1 named key (see `keys`) / 2 the character
+// a key typed with the modifiers held (all a browser can tell), b = pressed
+pub const EV_KEY: u8 = 4;
 
 pub fn event(kind: u8, a: u8, b: u8, payload: u32) -> [u8; 8] {
     let p = payload.to_le_bytes();
@@ -76,6 +78,11 @@ pub mod keys {
     pub const ALT: u32 = 18;
     pub const META: u32 = 19;
     pub const CAPS_LOCK: u32 = 20;
+    pub const PRINT_SCREEN: u32 = 21;
+    pub const MENU: u32 = 22;
+    pub const PAUSE: u32 = 23;
+    pub const SCROLL_LOCK: u32 = 24;
+    pub const NUM_LOCK: u32 = 25;
     pub const F1: u32 = 101; // F1..=F12 are 101..=112
 }
 
