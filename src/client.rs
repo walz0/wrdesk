@@ -1,7 +1,9 @@
 //! Viewer side: receives frames, shows them with Vulkan, and forwards mouse and keyboard input.
 
 use crate::render::{fit, Renderer};
-use crate::{audio, event, keys, mac, prompt, Result, AUDIO, EV_BUTTON, EV_KEY, EV_MOVE, EV_SCROLL, MAGIC};
+use crate::{
+    audio, event, keys, mac, prompt, Result, AUDIO, EV_BUTTON, EV_KEY, EV_MOTION, EV_MOVE, EV_SCROLL, MAGIC, SCREEN, SOUND,
+};
 use hmac::Mac;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -10,11 +12,11 @@ use std::thread;
 use std::time::Duration;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::window::{Fullscreen, Window, WindowId};
+use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 /// The latest remote screen contents, tightly packed BGRA.
 #[derive(Default)]
@@ -42,7 +44,8 @@ enum Handshake {
     Rejected,
 }
 
-fn handshake(addr: SocketAddr, password: Option<&str>) -> Result<Handshake> {
+/// Opens a connection of `kind` (SCREEN or SOUND).
+fn handshake(addr: SocketAddr, password: Option<&str>, kind: u8) -> Result<Handshake> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(TIMEOUT))?;
@@ -58,7 +61,7 @@ fn handshake(addr: SocketAddr, password: Option<&str>) -> Result<Handshake> {
         (true, Some(password)) => password,
         (true, None) => return Ok(Handshake::NeedsPassword),
     };
-    stream.write_all(&mac(key, &hello[6..22]).finalize().into_bytes())?;
+    stream.write_all(&[&mac(key, &hello[6..22]).finalize().into_bytes()[..], &[kind]].concat())?;
     let mut ok = [0u8; 1];
     stream.read_exact(&mut ok)?;
     Ok(if ok[0] == 1 { Handshake::Ok(stream) } else { Handshake::Rejected })
@@ -69,7 +72,7 @@ fn handshake(addr: SocketAddr, password: Option<&str>) -> Result<Handshake> {
 fn connect(addr: SocketAddr, mut password: Option<String>) -> Result<(TcpStream, Option<String>)> {
     let mut asked = false;
     loop {
-        match handshake(addr, password.as_deref())? {
+        match handshake(addr, password.as_deref(), SCREEN)? {
             Handshake::Ok(stream) => return Ok((stream, password)),
             // The host does not wait long for the answer, so ask first and reconnect.
             Handshake::NeedsPassword => {
@@ -89,7 +92,7 @@ fn connect(addr: SocketAddr, mut password: Option<String>) -> Result<(TcpStream,
 /// answers again. Gives up only if the host no longer accepts the password.
 fn reconnect(addr: SocketAddr, password: Option<&str>) -> Result<TcpStream> {
     loop {
-        match handshake(addr, password) {
+        match handshake(addr, password, SCREEN) {
             Ok(Handshake::Ok(stream)) => return Ok(stream),
             Ok(_) => return Err("the host's password changed".into()),
             Err(e) if e.is::<std::io::Error>() => thread::sleep(Duration::from_secs(1)), // not reachable yet
@@ -107,11 +110,12 @@ pub fn run(addr: SocketAddr, name: &str, password: Option<String>, view_only: bo
     let proxy = event_loop.create_proxy();
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let (shared, swap) = (frame.clone(), writer.clone());
-    let mut player = audio::Player::new().map_err(|e| eprintln!("no audio: {e}")).ok();
+    let audio_password = password.clone();
+    thread::spawn(move || listen(addr, audio_password));
     thread::spawn(move || {
         let mut stream = stream;
         loop {
-            let reason = match receive(stream, &shared, &mut player, &proxy) {
+            let reason = match receive(stream, &shared, &proxy) {
                 Ok(()) => return, // the window closed first
                 Err(e) => match e.downcast_ref::<std::io::Error>().map(|e| e.kind()) {
                     Some(std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
@@ -149,23 +153,57 @@ pub fn run(addr: SocketAddr, name: &str, password: Option<String>, view_only: bo
         remote: (0, 0),
         modifiers: ModifiersState::empty(),
         scroll: (0.0, 0.0),
+        captured: false,
+        motion: (0.0, 0.0),
         error: None,
     };
     event_loop.run_app(&mut app)?;
     app.error.map_or(Ok(()), Err)
 }
 
-/// Network thread: applies each incoming delta to the shared frame and wakes the window,
-/// and plays incoming audio. Returns Ok once the window has closed, or the error that
-/// ended the connection.
-fn receive(
-    mut stream: TcpStream,
-    shared: &Mutex<Frame>,
-    player: &mut Option<audio::Player>,
-    proxy: &EventLoopProxy<Wake>,
-) -> Result<()> {
+/// Audio thread: plays the host's audio, on a connection of its own so that it never waits
+/// for video. Reconnects whenever the link drops, for as long as the viewer runs.
+fn listen(addr: SocketAddr, password: Option<String>) {
+    let mut player = match audio::Player::new() {
+        Ok(player) => player,
+        Err(e) => return eprintln!("no audio: {e}"),
+    };
+    loop {
+        match handshake(addr, password.as_deref(), SOUND) {
+            Ok(Handshake::Ok(stream)) => {
+                let _ = play(stream, &mut player); // the screen connection reports the trouble
+            }
+            Ok(_) => return, // the password changed, which ends the screen connection too
+            Err(_) => {}
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn play(mut stream: TcpStream, player: &mut audio::Player) -> Result<()> {
+    let (mut header, mut payload, mut samples) = ([0u8; 20], Vec::new(), Vec::new());
+    loop {
+        stream.read_exact(&mut header)?;
+        let field = |i: usize| u32::from_le_bytes([header[i], header[i + 1], header[i + 2], header[i + 3]]);
+        let (w, kind, rate, channels, n) = (field(0), field(4), field(8), field(12), field(16) as usize);
+        if w != 0 || n > 1 << 20 {
+            return Err("bad audio packet".into());
+        }
+        payload.resize(n, 0);
+        stream.read_exact(&mut payload)?;
+        if kind == AUDIO {
+            samples.clear();
+            samples.extend(payload.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+            player.push(rate, channels as u16, &samples);
+        }
+    }
+}
+
+/// Network thread: applies each incoming delta to the shared frame and wakes the window.
+/// Returns Ok once the window has closed, or the error that ended the connection.
+fn receive(mut stream: TcpStream, shared: &Mutex<Frame>, proxy: &EventLoopProxy<Wake>) -> Result<()> {
     let mut header = [0u8; 20];
-    let (mut packed, mut delta, mut samples) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut packed, mut delta) = (Vec::new(), Vec::new());
     // The first frame of a connection is complete; it replaces what an earlier connection left.
     let mut fresh = true;
     loop {
@@ -179,11 +217,6 @@ fn receive(
             }
             packed.resize(n, 0);
             stream.read_exact(&mut packed)?;
-            if let (AUDIO, Some(player)) = (h, player.as_mut()) {
-                samples.clear();
-                samples.extend(packed.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
-                player.push(y, rows as u16, &samples);
-            }
             continue;
         }
         if h == 0 || w > 16384 || h > 16384 || rows == 0 || y >= h || rows > h - y {
@@ -228,6 +261,10 @@ struct App {
     remote: (u32, u32),
     modifiers: ModifiersState,
     scroll: (f64, f64),
+    // The mouse is captured (Ctrl+Alt+G): its motion goes to the host, as games want it,
+    // instead of where the pointer is. `motion` is the fraction of a count not sent yet.
+    captured: bool,
+    motion: (f64, f64),
     error: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
@@ -242,6 +279,25 @@ impl App {
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: Box<dyn std::error::Error + Send + Sync>) {
         self.error = Some(error);
         event_loop.exit();
+    }
+
+    /// Captures the mouse or lets it go. Grabbing is redone whenever the window gets focus
+    /// back, as the system lets go of it when another window takes focus.
+    fn capture(&mut self, window: &Window, on: bool) {
+        self.captured = on;
+        self.motion = (0.0, 0.0);
+        if on {
+            // Locked keeps the pointer still; where that is not supported it is kept inside the window.
+            let grabbed = window.set_cursor_grab(CursorGrabMode::Locked);
+            if let Err(e) = grabbed.or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined)) {
+                eprintln!("cannot hold the mouse inside the window: {e}");
+            }
+        } else {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+        }
+        window.set_cursor_visible(!on);
+        let note = if on { " (mouse captured: Ctrl+Alt+G releases it)" } else { "" };
+        window.set_title(&format!("{}{note}", self.title));
     }
 
     /// Sends whole scroll lines, carrying the fractional remainder over to the next event.
@@ -303,6 +359,23 @@ impl ApplicationHandler<Wake> for App {
         }
     }
 
+    fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        let DeviceEvent::MouseMotion { delta: (dx, dy) } = event else { return };
+        if !self.captured || !self.window.as_ref().is_some_and(|w| w.has_focus()) {
+            return;
+        }
+        // Raw mouse counts, before the system's pointer speed and acceleration, which the host applies.
+        self.motion.0 += dx;
+        self.motion.1 += dy;
+        let (x, y) = (self.motion.0.trunc(), self.motion.1.trunc());
+        self.motion.0 -= x;
+        self.motion.1 -= y;
+        if x != 0.0 || y != 0.0 {
+            let (x, y) = (x.clamp(-32767.0, 32767.0) as i16 as u16, y.clamp(-32767.0, 32767.0) as i16 as u16);
+            self.send(EV_MOTION, 0, 0, (x as u32) << 16 | y as u32);
+        }
+    }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         let (Some(window), Some(renderer)) = (self.window.clone(), self.renderer.as_mut()) else { return };
         match event {
@@ -329,7 +402,7 @@ impl ApplicationHandler<Wake> for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if self.remote.0 == 0 {
+                if self.remote.0 == 0 || self.captured {
                     return;
                 }
                 // Map the window position onto the letterboxed remote image.
@@ -356,14 +429,17 @@ impl ApplicationHandler<Wake> for App {
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
-                // Ctrl+Alt+F toggles fullscreen locally instead of going to the host.
-                if event.physical_key == PhysicalKey::Code(KeyCode::KeyF)
-                    && self.modifiers.control_key()
-                    && self.modifiers.alt_key()
-                {
+                // Ctrl+Alt+F (fullscreen) and Ctrl+Alt+G (capture the mouse) are for this
+                // window, not the host.
+                let local = |code| event.physical_key == PhysicalKey::Code(code);
+                if self.modifiers.control_key() && self.modifiers.alt_key() && (local(KeyCode::KeyF) || local(KeyCode::KeyG)) {
                     if pressed && !event.repeat {
-                        let fullscreen = window.fullscreen().is_none().then_some(Fullscreen::Borderless(None));
-                        window.set_fullscreen(fullscreen);
+                        if local(KeyCode::KeyF) {
+                            let fullscreen = window.fullscreen().is_none().then_some(Fullscreen::Borderless(None));
+                            window.set_fullscreen(fullscreen);
+                        } else {
+                            self.capture(&window, !self.captured);
+                        }
                     }
                     return;
                 }
@@ -382,6 +458,7 @@ impl ApplicationHandler<Wake> for App {
                 };
                 self.send(EV_KEY, kind, pressed as u8, code);
             }
+            WindowEvent::Focused(true) if self.captured => self.capture(&window, true),
             WindowEvent::Focused(false) => {
                 // Don't leave modifiers stuck down on the host (e.g. after Alt+Tab away).
                 for id in [keys::SHIFT, keys::CONTROL, keys::ALT, keys::META] {

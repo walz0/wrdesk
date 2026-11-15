@@ -4,14 +4,14 @@ use crate::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Records the default output device (loopback) until `alive` goes false or `send`
-/// fails. `send` gets the sample rate, channel count and interleaved samples.
-pub fn capture(alive: &AtomicBool, mut send: impl FnMut(u32, u16, &[i16]) -> Result<()>) -> Result<()> {
+/// Records the default output device (loopback) until `send` fails. `send` gets the sample
+/// rate, channel count and interleaved samples, exactly as recorded; while nothing plays it is
+/// called with no samples every 100 ms.
+pub fn capture(mut send: impl FnMut(u32, u16, &[f32]) -> Result<()>) -> Result<()> {
     let device = cpal::default_host().default_output_device().ok_or("no audio output device")?;
     let supported = device.default_output_config()?;
     let config = supported.config();
@@ -23,24 +23,24 @@ pub fn capture(alive: &AtomicBool, mut send: impl FnMut(u32, u16, &[i16]) -> Res
         format => return Err(format!("unsupported audio format {format:?}").into()),
     }?;
     stream.play()?;
-    while alive.load(Ordering::Relaxed) {
+    loop {
         // Nothing arrives while nothing is playing.
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(chunk) => send(config.sample_rate, config.channels, &chunk)?,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => send(config.sample_rate, config.channels, &[])?,
             Err(mpsc::RecvTimeoutError::Disconnected) => return Err("audio capture stopped".into()),
         }
     }
-    Ok(())
 }
 
-fn record<T>(device: &cpal::Device, config: &StreamConfig, tx: mpsc::Sender<Vec<i16>>) -> Result<Stream>
+fn record<T>(device: &cpal::Device, config: &StreamConfig, tx: mpsc::Sender<Vec<f32>>) -> Result<Stream>
 where
     T: SizedSample,
-    i16: FromSample<T>,
+    f32: FromSample<T>,
 {
+    // f32 holds every sample of f32 and i16 devices (and 24 bit ones) unchanged.
     let data = move |data: &[T], _: &_| {
-        let _ = tx.send(data.iter().map(|&s| i16::from_sample(s)).collect());
+        let _ = tx.send(data.iter().map(|&s| f32::from_sample(s)).collect());
     };
     // Building an input stream on an output device records what it plays.
     Ok(device.build_input_stream(*config, data, |e| eprintln!("audio: {e}"), None)?)
@@ -91,7 +91,7 @@ impl Player {
     }
 
     /// Queues interleaved samples recorded at `rate` with `channels` channels.
-    pub fn push(&mut self, rate: u32, channels: u16, samples: &[i16]) {
+    pub fn push(&mut self, rate: u32, channels: u16, samples: &[f32]) {
         if rate == 0 || channels == 0 {
             return;
         }
@@ -105,9 +105,10 @@ impl Player {
         let mut cur = vec![0.0; channels as usize];
         for frame in samples.chunks_exact(channels as usize) {
             for (c, &s) in cur.iter_mut().zip(frame) {
-                *c = s as f32 / 32768.0;
+                *c = s;
             }
-            // Linear interpolation between the previous and current incoming frame.
+            // Linear interpolation between the previous and current incoming frame. At equal
+            // rates this passes every sample through unchanged.
             while self.phase < 1.0 {
                 let t = self.phase as f32;
                 for c in 0..self.channels {
@@ -123,9 +124,10 @@ impl Player {
         let frame_ms = self.rate as usize * self.channels / 1000;
         let mut queue = self.queue.lock().unwrap();
         queue.samples.extend(out);
-        // Keep latency bounded when audio arrives faster than it plays (clock drift, bursts).
-        if queue.samples.len() > 150 * frame_ms {
-            let excess = queue.samples.len() - 50 * frame_ms;
+        // Audio is never dropped for a hiccup, only when it would otherwise lag ever further
+        // behind (the host's clock running a little faster than ours, or a long stall).
+        if queue.samples.len() > 500 * frame_ms {
+            let excess = queue.samples.len() - 100 * frame_ms;
             queue.samples.drain(..excess - excess % self.channels);
         }
     }
@@ -146,7 +148,7 @@ where
     T: SizedSample + FromSample<f32>,
 {
     // Wait for this much audio before starting, to ride out network jitter.
-    let prefill = config.sample_rate as usize * config.channels as usize * 40 / 1000;
+    let prefill = config.sample_rate as usize * config.channels as usize * 60 / 1000;
     let data = move |out: &mut [T], _: &_| {
         let mut queue = queue.lock().unwrap();
         if !queue.playing && queue.samples.len() < prefill {

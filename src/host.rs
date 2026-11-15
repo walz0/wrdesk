@@ -1,13 +1,16 @@
 //! Host side: captures the primary display, streams it, and injects the client's input.
 
-use crate::{audio, keys, mac, web, Result, ANNOUNCE, AUDIO, DISCOVER, EV_BUTTON, EV_KEY, EV_MOVE, EV_SCROLL, MAGIC, PORT};
+use crate::{
+    audio, keys, mac, web, Result, ANNOUNCE, AUDIO, DISCOVER, EV_BUTTON, EV_KEY, EV_MOTION, EV_MOVE, EV_SCROLL, MAGIC, PORT,
+    SOUND,
+};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use hmac::Mac;
 use scrap::{Capturer, Display};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -74,25 +77,37 @@ pub fn run(password: &str, options: Options) -> Result<()> {
     Ok(())
 }
 
-/// Serves one client until it leaves, logging its coming and going.
-pub fn session(stream: impl Link, password: &str, options: Options) {
+/// Serves one connection of a client until it leaves, logging the client's coming and going.
+pub fn session(mut stream: impl Link, password: &str, options: Options) {
     let peer = stream.socket().peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-    match serve(stream, password, &peer, options) {
+    let result = match authenticate(&mut stream, password) {
+        // A client's audio comes and goes with its screen connection, which does the logging.
+        Ok(SOUND) => {
+            if let Err(e) = send_audio(stream) {
+                eprintln!("no audio for {peer}: {e}");
+            }
+            return;
+        }
+        Ok(_) => serve(stream, &peer, options),
+        Err(e) => Err(e),
+    };
+    match result {
         Ok(()) => println!("{peer} disconnected"),
         Err(e) => println!("{peer} disconnected: {e}"),
     }
 }
 
-fn serve(mut stream: impl Link, password: &str, peer: &str, options: Options) -> Result<()> {
+/// Checks the client's password, returning what it wants the connection for.
+fn authenticate(stream: &mut impl Link, password: &str) -> Result<u8> {
     stream.socket().set_nodelay(true)?;
     stream.socket().set_read_timeout(Some(Duration::from_secs(10)))?;
 
     let mut nonce = [0u8; 16];
     getrandom::getrandom(&mut nonce).map_err(|e| e.to_string())?;
     stream.write_all(&[&MAGIC[..], &nonce, &[!password.is_empty() as u8]].concat())?;
-    let mut tag = [0u8; 32];
-    stream.read_exact(&mut tag)?;
-    if mac(password, &nonce).verify_slice(&tag).is_err() {
+    let mut answer = [0u8; 33]; // the HMAC, then the connection kind
+    stream.read_exact(&mut answer)?;
+    if mac(password, &nonce).verify_slice(&answer[..32]).is_err() {
         thread::sleep(Duration::from_secs(1)); // slows down password guessing
         stream.write_all(&[0])?;
         return Err("wrong password".into());
@@ -100,8 +115,34 @@ fn serve(mut stream: impl Link, password: &str, peer: &str, options: Options) ->
     stream.write_all(&[1])?;
     stream.socket().set_read_timeout(None)?;
     // A client that vanished (e.g. a laptop that went to sleep) stops acknowledging data;
-    // give up on it instead of holding the screen capture for minutes.
+    // give up on it instead of holding the capture for minutes.
     stream.socket().set_write_timeout(Some(Duration::from_secs(10)))?;
+    Ok(answer[32])
+}
+
+/// Streams what the speakers play until the client goes away.
+fn send_audio(mut stream: impl Write) -> Result<()> {
+    let (mut packet, mut last_sent, mut gone) = (Vec::new(), Instant::now(), false);
+    let result = audio::capture(|rate, channels, samples| {
+        if samples.is_empty() && last_sent.elapsed() < KEEPALIVE {
+            return Ok(());
+        }
+        packet.clear();
+        // Silence is sent as a keepalive, so the client can tell it from a dead link.
+        let header = if samples.is_empty() { [0; 5] } else { [0, AUDIO, rate, channels as u32, samples.len() as u32 * 4] };
+        for value in header {
+            packet.extend_from_slice(&value.to_le_bytes());
+        }
+        packet.extend(samples.iter().flat_map(|s| s.to_le_bytes()));
+        stream.write_all(&packet).inspect_err(|_| gone = true)?;
+        last_sent = Instant::now();
+        Ok(())
+    });
+    if gone { Ok(()) } else { result }
+}
+
+/// Streams the screen and injects the client's input until it leaves.
+fn serve(stream: impl Link, peer: &str, options: Options) -> Result<()> {
     println!("{peer} connected");
 
     let alive = Arc::new(AtomicBool::new(true));
@@ -114,33 +155,12 @@ fn serve(mut stream: impl Link, password: &str, peer: &str, options: Options) ->
         input_alive.store(false, Ordering::Relaxed);
     });
 
-    // Video and audio packets share the connection; each is written whole under the lock.
-    let writer = Arc::new(Mutex::new(stream.try_clone()?));
-    let (audio_writer, audio_alive) = (writer.clone(), alive.clone());
-    thread::spawn(move || {
-        let mut packet = Vec::new();
-        let result = audio::capture(&audio_alive, |rate, channels, samples| {
-            packet.clear();
-            for value in [0, AUDIO, rate, channels as u32, samples.len() as u32 * 2] {
-                packet.extend_from_slice(&value.to_le_bytes());
-            }
-            packet.extend(samples.iter().flat_map(|s| s.to_le_bytes()));
-            Ok(audio_writer.lock().unwrap().write_all(&packet)?)
-        });
-        if let Err(e) = result
-            && audio_alive.load(Ordering::Relaxed)
-        {
-            eprintln!("no audio: {e}");
-        }
-    });
-
-    let result = capture_loop(&writer, &alive, options);
-    alive.store(false, Ordering::Relaxed); // stops the audio thread
+    let result = capture_loop(stream.try_clone()?, &alive, options);
     let _ = stream.socket().shutdown(Shutdown::Both); // also ends the input thread
     result
 }
 
-fn capture_loop(stream: &Mutex<impl Write>, alive: &AtomicBool, options: Options) -> Result<()> {
+fn capture_loop(mut stream: impl Write, alive: &AtomicBool, options: Options) -> Result<()> {
     let frame_time = Duration::from_secs_f64(1.0 / options.fps as f64);
     let scale = options.scale as usize;
     let mut capturer: Option<Capturer> = None;
@@ -153,7 +173,7 @@ fn capture_loop(stream: &Mutex<impl Write>, alive: &AtomicBool, options: Options
     while alive.load(Ordering::Relaxed) {
         let start = Instant::now();
         if last_sent.elapsed() >= KEEPALIVE {
-            stream.lock().unwrap().write_all(&[0; HEADER])?;
+            stream.write_all(&[0; HEADER])?;
             last_sent = start;
         }
         let cap = match &mut capturer {
@@ -220,7 +240,7 @@ fn capture_loop(stream: &Mutex<impl Write>, alive: &AtomicBool, options: Options
                         for (i, value) in [w, h, y0, y1 - y0, n].into_iter().enumerate() {
                             out[i * 4..i * 4 + 4].copy_from_slice(&(value as u32).to_le_bytes());
                         }
-                        stream.lock().unwrap().write_all(&out[..HEADER + n])?;
+                        stream.write_all(&out[..HEADER + n])?;
                         last_sent = Instant::now();
                         force = false;
                         Ok(HEADER + n)
@@ -253,7 +273,10 @@ fn capture_loop(stream: &Mutex<impl Write>, alive: &AtomicBool, options: Options
 }
 
 fn input_loop(mut stream: impl Read) -> Result<()> {
-    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+    // Relative motion must reach Windows as relative motion, for the games that read it raw:
+    // enigo otherwise turns it into a move to an absolute position.
+    let settings = Settings { windows_subject_to_mouse_speed_and_acceleration_level: true, ..Settings::default() };
+    let mut enigo = Enigo::new(&settings).map_err(|e| e.to_string())?;
     let direction = |pressed: u8| if pressed != 0 { Direction::Press } else { Direction::Release };
     let mut modifiers = [false; 4]; // Shift, Control, Alt and Meta, as the client holds them
     #[cfg(windows)]
@@ -270,6 +293,7 @@ fn input_loop(mut stream: impl Read) -> Result<()> {
                 let y = (payload & 0xffff) as i64 * (h as i64 - 1) / 65535;
                 enigo.move_mouse(x as i32, y as i32, Coordinate::Abs)
             }),
+            EV_MOTION => enigo.move_mouse((payload >> 16) as i16 as i32, payload as i16 as i32, Coordinate::Rel),
             EV_BUTTON => {
                 let button = match ev[1] {
                     0 => Button::Left,

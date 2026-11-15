@@ -11,15 +11,20 @@
 //!
 //! Wire protocol (TCP, little endian):
 //!   host -> client   MAGIC, 16 byte nonce, 1 byte (1 = password set)
-//!   client -> host   HMAC-SHA256(password, nonce); the password is empty if none is set
-//!   host -> client   1 byte (1 = ok), then frames: [u32 w][u32 h][u32 y][u32 rows][u32 len]
-//!                    followed by lz4(rows y..y+rows of the frame XOR the previous frame).
-//!                    The first frame of a connection is complete.
+//!   client -> host   HMAC-SHA256(password, nonce); the password is empty if none is set,
+//!                    then 1 byte: what the connection is for, SCREEN or SOUND
+//!   host -> client   1 byte (1 = ok), then packets: [u32 w][u32 h][u32 y][u32 rows][u32 len]
+//!                    and len bytes of payload.
 //!                    A header with w = 0 is not a frame: h is the packet kind, len the
 //!                    payload size. Kind 0 (all zero) is a keepalive, sent after a second
-//!                    without frames. Kind AUDIO has y = sample rate, rows = channels, and
-//!                    interleaved i16 samples as payload: whatever the host's speakers play.
-//!   client -> host   8 byte input events, see `event`
+//!                    of silence.
+//!
+//! A SCREEN connection carries frames: lz4(rows y..y+rows of the frame XOR the previous frame).
+//! The first frame of a connection is complete. The client sends 8 byte input events, see `event`.
+//!
+//! A SOUND connection carries what the host's speakers play, as packets of kind AUDIO: y = sample
+//! rate, rows = channels, and interleaved f32 samples as payload, exactly as recorded. It is a
+//! connection of its own so that audio never waits behind a big frame; the two are not synced.
 //!
 //! With --web, hosts also serve a web client over HTTP on WEB_PORT (for phones). It speaks the same
 //! protocol over HTTP requests, see web.rs.
@@ -39,10 +44,12 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 
 pub const PORT: u16 = 47110;
 pub const WEB_PORT: u16 = 47111; // the host's web client, for browsers
-pub const MAGIC: &[u8; 6] = b"WRDSK3";
+pub const MAGIC: &[u8; 6] = b"WRDSK4";
 pub const DISCOVER: &[u8] = b"WRDESK?";
 pub const ANNOUNCE: &[u8] = b"WRDESK!";
 pub const AUDIO: u32 = 1; // packet kind, see the wire protocol above
+pub const SCREEN: u8 = 0; // connection kinds, see the wire protocol above
+pub const SOUND: u8 = 1;
 
 pub const EV_MOVE: u8 = 1; // payload = x << 16 | y, each 0..=65535 across the remote screen
 pub const EV_BUTTON: u8 = 2; // a = 0 left / 1 right / 2 middle, b = pressed
@@ -50,6 +57,9 @@ pub const EV_SCROLL: u8 = 3; // a = 0 vertical / 1 horizontal, payload = lines a
 // a = 0 the character a key types without modifiers / 1 named key (see `keys`) / 2 the character
 // a key typed with the modifiers held (all a browser can tell), b = pressed
 pub const EV_KEY: u8 = 4;
+// payload = dx << 16 | dy, each an i16: mouse motion as a mouse reports it, for games and other
+// programs that read the mouse itself rather than where the pointer is
+pub const EV_MOTION: u8 = 5;
 
 pub fn event(kind: u8, a: u8, b: u8, payload: u32) -> [u8; 8] {
     let p = payload.to_le_bytes();
@@ -236,7 +246,8 @@ fn run() -> Result<()> {
                      \x20                                            view and control a host (name or IP; omit to auto-discover)\n\
                      wrdesk                                       list the hosts on the network and pick one\n\n\
                      The password can also be set with the WRDESK_PASSWORD environment variable.\n\
-                     In the viewer, Ctrl+Alt+F toggles fullscreen."
+                     In the viewer, Ctrl+Alt+F toggles fullscreen and Ctrl+Alt+G captures the mouse\n\
+                     (for games: the host gets mouse motion instead of pointer positions)."
                 );
                 return Ok(());
             }
