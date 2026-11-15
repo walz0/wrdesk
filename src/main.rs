@@ -259,7 +259,7 @@ fn run() -> Result<()> {
             host::run(&password.unwrap_or_default(), options)
         }
         Action::Join(name, addr) => {
-            println!("Connecting to {name} ({})...", addr.ip());
+            println!("wrdesk {} connecting to {name} ({})...", env!("CARGO_PKG_VERSION"), addr.ip());
             client::run(addr, &name, password, view_only)
         }
     });

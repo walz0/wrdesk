@@ -56,7 +56,7 @@ pub fn run(password: &str, options: Options) -> Result<()> {
         }
     });
 
-    println!("Hosting '{name}' on port {PORT}. Press Ctrl+C to stop.");
+    println!("wrdesk {} hosting '{name}' on port {PORT}. Press Ctrl+C to stop.", env!("CARGO_PKG_VERSION"));
     if let Err(e) = web::listen(password, options) {
         eprintln!("no web client: {e}");
     }
