@@ -65,13 +65,37 @@ const COLOR_RANGE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
     layer_count: 1,
 };
 
+/// Loads the Vulkan loader. On macOS the default `dlopen` search path doesn't include
+/// Homebrew's lib directories (or the LunarG SDK's), so try those explicitly.
+unsafe fn load_vulkan() -> Result<ash::Entry> {
+    let first_error = match ash::Entry::load() {
+        Ok(entry) => return Ok(entry),
+        Err(e) => e,
+    };
+    if cfg!(target_os = "macos") {
+        for path in [
+            "/opt/homebrew/lib/libvulkan.1.dylib",
+            "/usr/local/lib/libvulkan.1.dylib",
+        ] {
+            if let Ok(entry) = ash::Entry::load_from(path) {
+                return Ok(entry);
+            }
+        }
+        return Err(format!(
+            "Vulkan is not available ({first_error}); install it with `brew install molten-vk vulkan-loader`"
+        )
+        .into());
+    }
+    Err(format!("Vulkan is not available: {first_error}").into())
+}
+
 impl Renderer {
     pub fn new(window: &Window) -> Result<Self> {
         let display_handle = window.display_handle()?.as_raw();
         let window_handle = window.window_handle()?.as_raw();
         let macos = cfg!(target_os = "macos"); // MoltenVK is a "portability" driver
         unsafe {
-            let entry = ash::Entry::load().map_err(|e| format!("Vulkan is not available: {e}"))?;
+            let entry = load_vulkan()?;
 
             let mut extensions = ash_window::enumerate_required_extensions(display_handle)?.to_vec();
             let mut flags = vk::InstanceCreateFlags::empty();
