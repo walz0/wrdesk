@@ -1,11 +1,11 @@
 //! wrdesk - a tiny LAN remote desktop.
 //!
-//!   wrdesk host [-p PASSWORD] [--fps N] [--scale N] [--mbps N]   share this machine
+//!   wrdesk host [-p PASSWORD] [--web] [--fps N] [--scale N] [--mbps N]   share this machine
 //!   wrdesk join [TARGET] [-p PASSWORD]     view and control a host (name or IP; omit to auto-discover)
 //!   wrdesk                                 list the hosts on the network and pick one (or host)
 //!
-//! Hosts are open to the whole LAN unless a password is set. A browser (e.g. on a phone)
-//! can join too: the host prints the address to open.
+//! Hosts are open to the whole LAN unless a password is set. Hosting with --web (or w in the
+//! menu) lets a browser (e.g. on a phone) join too: the host prints the address to open.
 //!
 //! Discovery (UDP broadcast): DISCOVER is answered with ANNOUNCE, 1 byte (1 = password set), host name.
 //!
@@ -21,7 +21,7 @@
 //!                    interleaved i16 samples as payload: whatever the host's speakers play.
 //!   client -> host   8 byte input events, see `event`
 //!
-//! Hosts also serve a web client over HTTP on WEB_PORT (for phones). It speaks the same
+//! With --web, hosts also serve a web client over HTTP on WEB_PORT (for phones). It speaks the same
 //! protocol over HTTP requests, see web.rs.
 
 mod audio;
@@ -140,7 +140,7 @@ pub fn prompt(text: &str) -> Result<String> {
 }
 
 enum Action {
-    Host,
+    Host { web: bool }, // web = also serve the browser client
     Join(String, SocketAddr),
 }
 
@@ -154,11 +154,13 @@ fn menu() -> Result<Action> {
             println!("  (none found)");
         }
         list(&hosts);
-        println!("\n  number = join   h = host this machine   Enter = refresh   q = quit");
+        println!("\n  number = join   h = host this machine   w = host for web browsers too");
+        println!("  Enter = refresh   q = quit");
         let answer = prompt("  (or type a name / IP address): ")?;
         match answer.to_lowercase().as_str() {
             "" => continue,
-            "h" | "host" => return Ok(Action::Host),
+            "h" | "host" => return Ok(Action::Host { web: false }),
+            "w" | "web" => return Ok(Action::Host { web: true }),
             "q" | "quit" | "exit" => std::process::exit(0),
             _ => {}
         }
@@ -212,19 +214,21 @@ fn number(value: Option<String>, flag: &str, min: f64, max: f64) -> Result<f64> 
 fn run() -> Result<()> {
     let mut password = std::env::var("WRDESK_PASSWORD").ok().filter(|p| !p.is_empty());
     let mut view_only = false;
-    let mut options = host::Options { fps: 30, scale: 1, mbps: 0.0 };
+    let mut options = host::Options { fps: 30, scale: 1, mbps: 0.0, web: false };
     let mut positional = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-p" | "--password" => password = Some(args.next().ok_or("-p needs a value")?),
             "--view-only" => view_only = true,
+            "--web" => options.web = true,
             "--fps" => options.fps = number(args.next(), "--fps", 1.0, 240.0)? as u32,
             "--scale" => options.scale = number(args.next(), "--scale", 1.0, 8.0)? as u32,
             "--mbps" => options.mbps = number(args.next(), "--mbps", 0.1, 100000.0)?,
             "-h" | "--help" => {
                 println!(
                     "wrdesk host [-p PASSWORD] [options]          share this machine (no password unless -p is given)\n\
+                     \x20   --web       also let web browsers (e.g. phones) join\n\
                      \x20   --fps N     frame rate limit (default 30)\n\
                      \x20   --scale N   send 1/N of the resolution (default 1; 2 = a quarter of the pixels)\n\
                      \x20   --mbps N    bandwidth limit in megabits per second (default unlimited)\n\
@@ -244,7 +248,7 @@ fn run() -> Result<()> {
     let join = |(name, addr)| Action::Join(name, addr);
     let action = match positional.first().map(String::as_str) {
         None => menu(),
-        Some("host") => Ok(Action::Host),
+        Some("host") => Ok(Action::Host { web: options.web }),
         // `wrdesk join [TARGET]`, or just `wrdesk TARGET`.
         Some("join") => resolve(positional.get(1).map(String::as_str)).map(join),
         target => resolve(target).map(join),
@@ -252,11 +256,11 @@ fn run() -> Result<()> {
     let result = action.and_then(|action| match action {
         // Hosting is headless: it never opens a window or shows the video feed.
         // Without a password anyone on the network can join.
-        Action::Host => {
+        Action::Host { web } => {
             if interactive && password.is_none() {
                 password = Some(prompt("Password (Enter for none): ")?).filter(|p| !p.is_empty());
             }
-            host::run(&password.unwrap_or_default(), options)
+            host::run(&password.unwrap_or_default(), host::Options { web, ..options })
         }
         Action::Join(name, addr) => {
             println!("wrdesk {} connecting to {name} ({})...", env!("CARGO_PKG_VERSION"), addr.ip());

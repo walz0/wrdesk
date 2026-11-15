@@ -20,6 +20,7 @@ pub struct Options {
     pub fps: u32,
     pub scale: u32,
     pub mbps: f64, // 0 = unlimited
+    pub web: bool, // also serve the browser client on WEB_PORT
 }
 
 /// A connection to a client: a plain socket, or a browser's HTTP requests.
@@ -57,8 +58,10 @@ pub fn run(password: &str, options: Options) -> Result<()> {
     });
 
     println!("wrdesk {} hosting '{name}' on port {PORT}. Press Ctrl+C to stop.", env!("CARGO_PKG_VERSION"));
-    if let Err(e) = web::listen(password, options) {
-        eprintln!("no web client: {e}");
+    if options.web {
+        if let Err(e) = web::listen(password, options) {
+            eprintln!("no web client: {e}");
+        }
     }
     if !locked {
         println!("No password set: anyone on this network can view and control this computer (-p sets one).");
