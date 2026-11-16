@@ -60,6 +60,10 @@ pub const EV_KEY: u8 = 4;
 // payload = dx << 16 | dy, each an i16: mouse motion as a mouse reports it, for games and other
 // programs that read the mouse itself rather than where the pointer is
 pub const EV_MOTION: u8 = 5;
+// a = 1 while the viewer has the mouse captured, for games: the host then streams at least
+// GAME_FPS, and picks up each new frame sooner
+pub const EV_GAME: u8 = 6;
+pub const GAME_FPS: u32 = 60;
 
 pub fn event(kind: u8, a: u8, b: u8, payload: u32) -> [u8; 8] {
     let p = payload.to_le_bytes();
@@ -247,7 +251,8 @@ fn run() -> Result<()> {
                      wrdesk                                       list the hosts on the network and pick one\n\n\
                      The password can also be set with the WRDESK_PASSWORD environment variable.\n\
                      In the viewer, Ctrl+Alt+F toggles fullscreen and Ctrl+Alt+G captures the mouse\n\
-                     (for games: the host gets mouse motion instead of pointer positions)."
+                     (for games: the host gets mouse motion instead of pointer positions, and streams
+                      at 60 fps or more, with less delay, until it is released)."
                 );
                 return Ok(());
             }

@@ -124,7 +124,7 @@ $('password').hidden = !locked;
 // ---- connection ----
 // The host's packets are the endless body of one request; ours are posted, one request at a time.
 
-const MOVE = 1, BUTTON = 2, SCROLL = 3, KEY = 4, MOTION = 5;
+const MOVE = 1, BUTTON = 2, SCROLL = 3, KEY = 4, MOTION = 5, GAME = 6;
 const SCREEN = 0, SOUND = 1; // what a connection is for
 let id = '', hangUp = null; // the connection, and what ends it
 let live = false, lastPacket = 0;
@@ -209,6 +209,7 @@ async function connect() {
       if (bytes[0] != 1) return 'Wrong password.';
       stage = 2;
       live = retry = fresh = true;
+      if (captured()) send(GAME, 1, 0, 0); // a new connection starts out of game mode
       login.hidden = $('note').hidden = true;
       listen(abort.signal);
     } else {
@@ -480,6 +481,8 @@ function capture() {
   // Unadjusted motion skips this computer's pointer acceleration (the host applies its own).
   view.requestPointerLock({ unadjustedMovement: true })?.catch?.(() => view.requestPointerLock());
 }
+// While captured the host streams at 60 fps or more, with less delay.
+document.addEventListener('pointerlockchange', () => send(GAME, captured() ? 1 : 0, 0, 0));
 let motion = [0, 0]; // the fraction of a count not sent yet
 view.addEventListener('pointermove', e => {
   if (e.pointerType != 'mouse') return;

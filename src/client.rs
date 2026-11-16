@@ -2,7 +2,7 @@
 
 use crate::render::{fit, Renderer};
 use crate::{
-    audio, event, keys, mac, prompt, Result, AUDIO, EV_BUTTON, EV_KEY, EV_MOTION, EV_MOVE, EV_SCROLL, MAGIC, SCREEN, SOUND,
+    audio, event, keys, mac, prompt, Result, AUDIO, EV_BUTTON, EV_GAME, EV_KEY, EV_MOTION, EV_MOVE, EV_SCROLL, MAGIC, SCREEN, SOUND,
 };
 use hmac::Mac;
 use std::io::{Read, Write};
@@ -284,6 +284,9 @@ impl App {
     /// Captures the mouse or lets it go. Grabbing is redone whenever the window gets focus
     /// back, as the system lets go of it when another window takes focus.
     fn capture(&mut self, window: &Window, on: bool) {
+        if on != self.captured {
+            self.send(EV_GAME, on as u8, 0, 0); // the host streams faster while it lasts
+        }
         self.captured = on;
         self.motion = (0.0, 0.0);
         if on {
@@ -351,8 +354,11 @@ impl ApplicationHandler<Wake> for App {
             }
             Wake::Reconnected => {
                 println!("Reconnected.");
-                if let Some(window) = &self.window {
-                    window.set_title(&self.title);
+                if self.captured {
+                    self.send(EV_GAME, 1, 0, 0); // a new connection starts out of game mode
+                }
+                if let Some(window) = self.window.clone() {
+                    self.capture(&window, self.captured); // also puts the title back
                 }
             }
             Wake::Closed(reason) => self.fail(event_loop, format!("connection closed: {reason}").into()),

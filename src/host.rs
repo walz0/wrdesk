@@ -1,8 +1,8 @@
 //! Host side: captures the primary display, streams it, and injects the client's input.
 
 use crate::{
-    audio, keys, mac, web, Result, ANNOUNCE, AUDIO, DISCOVER, EV_BUTTON, EV_KEY, EV_MOTION, EV_MOVE, EV_SCROLL, MAGIC, PORT,
-    SOUND,
+    audio, keys, mac, web, Result, ANNOUNCE, AUDIO, DISCOVER, EV_BUTTON, EV_GAME, EV_KEY, EV_MOTION, EV_MOVE, EV_SCROLL,
+    GAME_FPS, MAGIC, PORT, SOUND,
 };
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use hmac::Mac;
@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 const HEADER: usize = 20;
 /// An idle host sends an empty header this often, so clients can tell a still screen from a dead link.
 const KEEPALIVE: Duration = Duration::from_secs(1);
+/// How often the screen is checked for a new frame once one is due: in game mode, and otherwise.
+const POLL_GAME: Duration = Duration::from_millis(1);
+const POLL: Duration = Duration::from_millis(8);
 
 #[derive(Clone, Copy)]
 pub struct Options {
@@ -146,22 +149,22 @@ fn serve(stream: impl Link, peer: &str, options: Options) -> Result<()> {
     println!("{peer} connected");
 
     let alive = Arc::new(AtomicBool::new(true));
+    let game = Arc::new(AtomicBool::new(false)); // the client has the mouse captured, for a game
     let input = stream.try_clone()?;
-    let input_alive = alive.clone();
+    let (input_alive, input_game) = (alive.clone(), game.clone());
     thread::spawn(move || {
-        if let Err(e) = input_loop(input) {
+        if let Err(e) = input_loop(input, &input_game) {
             eprintln!("cannot inject input: {e}");
         }
         input_alive.store(false, Ordering::Relaxed);
     });
 
-    let result = capture_loop(stream.try_clone()?, &alive, options);
+    let result = capture_loop(stream.try_clone()?, peer, &alive, &game, options);
     let _ = stream.socket().shutdown(Shutdown::Both); // also ends the input thread
     result
 }
 
-fn capture_loop(mut stream: impl Write, alive: &AtomicBool, options: Options) -> Result<()> {
-    let frame_time = Duration::from_secs_f64(1.0 / options.fps as f64);
+fn capture_loop(mut stream: impl Write, peer: &str, alive: &AtomicBool, game: &AtomicBool, options: Options) -> Result<()> {
     let scale = options.scale as usize;
     let mut capturer: Option<Capturer> = None;
     // `prev` is the last frame the client has; `scaled` is only used when downscaling.
@@ -169,12 +172,29 @@ fn capture_loop(mut stream: impl Write, alive: &AtomicBool, options: Options) ->
     let mut size = (0, 0);
     let mut force = false;
     let mut last_sent = Instant::now();
+    // When the next frame may be captured, which holds the frame rate (and --mbps).
+    let mut due = Instant::now();
+    let mut gaming = false;
 
     while alive.load(Ordering::Relaxed) {
+        if game.load(Ordering::Relaxed) != gaming {
+            gaming = !gaming;
+            match gaming {
+                true => println!("{peer} captured the mouse: game mode, {} fps", options.fps.max(GAME_FPS)),
+                false => println!("{peer} released the mouse"),
+            }
+        }
+        let fps = if gaming { options.fps.max(GAME_FPS) } else { options.fps };
+        let frame_time = Duration::from_secs_f64(1.0 / fps as f64);
+
         let start = Instant::now();
         if last_sent.elapsed() >= KEEPALIVE {
             stream.write_all(&[0; HEADER])?;
             last_sent = start;
+        }
+        if start < due {
+            thread::sleep((due - start).min(KEEPALIVE));
+            continue;
         }
         let cap = match &mut capturer {
             Some(cap) => cap,
@@ -250,29 +270,30 @@ fn capture_loop(mut stream: impl Write, alive: &AtomicBool, options: Options) ->
             Err(e) => Err(e.kind()),
         };
 
-        let wait = match sent {
+        match sent {
             // Hold the frame rate, and stretch the gap after big frames to respect --mbps.
             Ok(bytes) => {
                 let mut interval = frame_time;
                 if options.mbps > 0.0 {
                     interval = interval.max(Duration::from_secs_f64(bytes as f64 * 8.0 / (options.mbps * 1e6)));
                 }
-                interval.saturating_sub(start.elapsed())
+                // The schedule may slip a quarter frame behind, so the next frame can be taken
+                // as soon as it appears rather than up to a frame late; the rate still holds.
+                due = due.max(start.checked_sub(frame_time / 4).unwrap_or(start)) + interval;
             }
-            // Nothing new on screen yet.
-            Err(ErrorKind::WouldBlock) => Duration::from_millis(8),
+            // Nothing new on screen yet: look again soon. A game wants the frame the moment it is drawn.
+            Err(ErrorKind::WouldBlock) => thread::sleep(if gaming { POLL_GAME } else { POLL }),
             // Resolution change, secure desktop, etc: start capturing again.
             Err(_) => {
                 capturer = None;
-                Duration::from_millis(250)
+                thread::sleep(Duration::from_millis(250));
             }
-        };
-        thread::sleep(wait);
+        }
     }
     Ok(())
 }
 
-fn input_loop(mut stream: impl Read) -> Result<()> {
+fn input_loop(mut stream: impl Read, game: &AtomicBool) -> Result<()> {
     // Relative motion must reach Windows as relative motion, for the games that read it raw:
     // enigo otherwise turns it into a move to an absolute position.
     let settings = Settings { windows_subject_to_mouse_speed_and_acceleration_level: true, ..Settings::default() };
@@ -301,6 +322,10 @@ fn input_loop(mut stream: impl Read) -> Result<()> {
                     _ => Button::Middle,
                 };
                 enigo.button(button, direction(ev[2]))
+            }
+            EV_GAME => {
+                game.store(ev[1] != 0, Ordering::Relaxed);
+                Ok(())
             }
             EV_SCROLL => enigo.scroll(payload as i32, if ev[1] == 0 { Axis::Vertical } else { Axis::Horizontal }),
             EV_KEY => {
